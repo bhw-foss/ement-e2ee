@@ -131,6 +131,8 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
             }
 
             maybe_feed_verification(ctx, &new_event).await;
+            // Harvest attachment keys and expose plain URLs for ement.
+            crate::crypto::media::harvest_and_rewrite_decrypted(ctx, &mut new_event);
             *event = new_event;
         }
         Ok(RoomEventDecryptionResult::UnableToDecrypt(info)) => {

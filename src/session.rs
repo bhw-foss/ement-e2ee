@@ -26,6 +26,8 @@ pub struct AccountContext {
     pub share_lock: Mutex<()>,
     /// Room metadata tracked from proxied traffic.
     pub rooms: crypto::rooms::RoomTracker,
+    /// Persistent mxc -> attachment-encryption-key cache.
+    pub media: crypto::media::MediaKeyCache,
 }
 
 #[derive(Clone, Default)]
@@ -120,6 +122,10 @@ impl SessionManager {
         }
 
         let olm = crypto::machine::open_machine(config, &user_id, &device_id).await?;
+        // open_machine created the directory.
+        let media = crypto::media::MediaKeyCache::open(
+            &crypto::machine::account_store_dir(config, &user_id, &device_id).join("media.sqlite"),
+        )?;
         tracing::info!(%user_id, %device_id, "session initialized");
 
         let ctx = Arc::new(AccountContext {
@@ -131,6 +137,7 @@ impl SessionManager {
             pump_lock: Mutex::new(()),
             share_lock: Mutex::new(()),
             rooms: crypto::rooms::RoomTracker::default(),
+            media,
         });
         guard.insert(token.to_owned(), ctx.clone());
         drop(guard);

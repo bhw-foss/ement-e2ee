@@ -9,7 +9,7 @@ use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId};
 use serde_json::Value;
 
-use crate::crypto::{machine, rooms};
+use crate::crypto::{machine, media, rooms};
 use crate::error::ProxyError;
 use crate::proxy::AppState;
 use crate::proxy::intercept::raw_response;
@@ -41,39 +41,51 @@ pub async fn handle_send(
     let encrypted = rooms::is_room_encrypted(&ctx, &room_id)
         .await
         .context("could not determine room encryption state")?;
-    if !encrypted {
-        return passthrough(state, req).await;
-    }
 
+    let original_path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
     let body_bytes = axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::BadRequest(format!("failed to read send body: {e}")))?;
-    let content: Value = serde_json::from_slice(&body_bytes)
+    let mut content: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::BadRequest(format!("send body is not JSON: {e}")))?;
 
-    let encrypted_content = encrypt_content(&ctx, &room_id, &event_type, content)
-        .await
-        .context("failed to encrypt event")?;
+    let (path, wire_content) = if encrypted {
+        // Media contents reference an mxc we encrypted at upload time: move
+        // the url into the spec `file` object so recipients can decrypt.
+        media::rewrite_content_for_encrypted_room(&ctx, &mut content);
+        let encrypted_content = encrypt_content(&ctx, &room_id, &event_type, content)
+            .await
+            .context("failed to encrypt event")?;
+        // Forward as m.room.encrypted, preserving the client's transaction ID
+        // so ement's local echo and dedup logic keep working.
+        let path = format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.encrypted/{}",
+            machine::enc(room_id.as_str()),
+            machine::enc(&txn_id)
+        );
+        (path, encrypted_content)
+    } else {
+        // All uploads are encrypted by the proxy; media sent into an
+        // unencrypted room must be re-uploaded as plaintext first.
+        media::reupload_plaintext_if_needed(state, &ctx, &mut content)
+            .await
+            .context("media fix-up for unencrypted room failed")?;
+        (original_path, content)
+    };
 
-    // Forward as m.room.encrypted, preserving the client's transaction ID so
-    // ement's local echo and dedup logic keep working.
-    let path = format!(
-        "/_matrix/client/v3/rooms/{}/send/m.room.encrypted/{}",
-        machine::enc(room_id.as_str()),
-        machine::enc(&txn_id)
-    );
     let (status, response_body) = ctx
         .upstream
-        .json_request(
-            reqwest::Method::PUT,
-            &path,
-            &ctx.token,
-            Some(&encrypted_content),
-        )
+        .json_request(reqwest::Method::PUT, &path, &ctx.token, Some(&wire_content))
         .await
-        .context("failed to send encrypted event")?;
+        .context("failed to forward send")?;
 
-    tracing::info!(%room_id, %event_type, %status, "sent encrypted event");
+    if encrypted {
+        tracing::info!(%room_id, %event_type, %status, "sent encrypted event");
+    }
     raw_response(
         status.as_u16(),
         Some(axum::http::HeaderValue::from_static("application/json")),

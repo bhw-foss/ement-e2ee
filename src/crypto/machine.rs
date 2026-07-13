@@ -19,16 +19,25 @@ use serde_json::json;
 use crate::config::Config;
 use crate::session::{AccountContext, sanitize_for_path};
 
+/// Per-account on-disk state directory.
+pub fn account_store_dir(
+    config: &Config,
+    user_id: &UserId,
+    device_id: &DeviceId,
+) -> std::path::PathBuf {
+    config
+        .store_dir
+        .join(sanitize_for_path(user_id.as_str()))
+        .join(sanitize_for_path(device_id.as_str()))
+}
+
 /// Open (or create) the persistent OlmMachine for a user/device pair.
 pub async fn open_machine(
     config: &Config,
     user_id: &UserId,
     device_id: &DeviceId,
 ) -> anyhow::Result<OlmMachine> {
-    let dir = config
-        .store_dir
-        .join(sanitize_for_path(user_id.as_str()))
-        .join(sanitize_for_path(device_id.as_str()));
+    let dir = account_store_dir(config, user_id, device_id);
     let store = SqliteCryptoStore::open(&dir, config.store_passphrase.as_deref())
         .await
         .with_context(|| format!("failed to open crypto store at {}", dir.display()))?;

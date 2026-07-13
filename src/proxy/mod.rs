@@ -106,8 +106,30 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
             }
             None => passthrough(&state, req).await,
         },
-        // Interception for send + media lands in later milestones; everything
-        // else passes through unchanged.
+        Route::MediaUpload => match context_for(&state, token).await {
+            Some(ctx) => crate::crypto::media::handle_upload(&state, ctx, req).await,
+            None => passthrough(&state, req).await,
+        },
+        Route::MediaDownload {
+            server,
+            media_id,
+            authenticated,
+        } => {
+            // The legacy download path (used by ement for avatars) carries no
+            // Bearer token; borrow any active session's upstream credentials.
+            let ctx = if authenticated {
+                context_for(&state, token).await
+            } else {
+                state.sessions.list().await.into_iter().next()
+            };
+            match ctx {
+                Some(ctx) => {
+                    crate::crypto::media::handle_download(&state, ctx, server, media_id).await
+                }
+                None => passthrough(&state, req).await,
+            }
+        }
+        // Everything else passes through unchanged.
         _ => passthrough(&state, req).await,
     }
 }
