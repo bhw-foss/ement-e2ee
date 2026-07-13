@@ -21,6 +21,9 @@ pub struct AccountContext {
     /// Serializes outgoing_requests/mark_request_as_sent cycles, as required
     /// by the matrix-sdk-crypto integration contract.
     pub pump_lock: Mutex<()>,
+    /// Serializes the claim/share section of the send path so concurrent
+    /// sends don't race on session establishment.
+    pub share_lock: Mutex<()>,
     /// Room metadata tracked from proxied traffic.
     pub rooms: crypto::rooms::RoomTracker,
 }
@@ -126,6 +129,7 @@ impl SessionManager {
             olm,
             upstream: upstream.clone(),
             pump_lock: Mutex::new(()),
+            share_lock: Mutex::new(()),
             rooms: crypto::rooms::RoomTracker::default(),
         });
         guard.insert(token.to_owned(), ctx.clone());

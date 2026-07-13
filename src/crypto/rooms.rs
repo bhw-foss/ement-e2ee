@@ -66,6 +66,113 @@ impl RoomTracker {
     }
 }
 
+/// Is this room encrypted? Checks the negative cache, then the persisted
+/// RoomSettings, then falls back to asking the homeserver for the
+/// m.room.encryption state event.
+pub async fn is_room_encrypted(ctx: &AccountContext, room_id: &RoomId) -> anyhow::Result<bool> {
+    if ctx.rooms.is_known_unencrypted(room_id).await {
+        return Ok(false);
+    }
+    if ctx.olm.room_settings(room_id).await?.is_some() {
+        return Ok(true);
+    }
+
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/state/m.room.encryption",
+        crate::crypto::machine::enc(room_id.as_str())
+    );
+    let (status, body) = ctx
+        .upstream
+        .json_request(reqwest::Method::GET, &path, &ctx.token, None)
+        .await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        ctx.rooms.mark_unencrypted(room_id).await;
+        return Ok(false);
+    }
+    if !status.is_success() {
+        anyhow::bail!("failed to fetch m.room.encryption state: {status} {body}");
+    }
+    // The state endpoint returns the event *content* directly.
+    let Some(settings) = room_settings_from_content(&body) else {
+        anyhow::bail!("malformed m.room.encryption content: {body}");
+    };
+    ctx.rooms.mark_encrypted(room_id).await;
+    if let Err(e) = ctx.olm.set_room_settings(room_id, &settings).await {
+        tracing::debug!(%room_id, error = ?e, "set_room_settings rejected");
+    }
+    Ok(true)
+}
+
+/// Full joined member list for a room (sync state is lazy-loaded, so room key
+/// sharing must use this endpoint), cached with a TTL.
+pub async fn joined_members(
+    ctx: &AccountContext,
+    room_id: &RoomId,
+) -> anyhow::Result<Vec<OwnedUserId>> {
+    if let Some(members) = ctx.rooms.cached_members(room_id).await {
+        return Ok(members);
+    }
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/joined_members",
+        crate::crypto::machine::enc(room_id.as_str())
+    );
+    let (status, body) = ctx
+        .upstream
+        .json_request(reqwest::Method::GET, &path, &ctx.token, None)
+        .await?;
+    if !status.is_success() {
+        anyhow::bail!("joined_members failed: {status} {body}");
+    }
+    let members: Vec<OwnedUserId> = body
+        .get("joined")
+        .and_then(|v| v.as_object())
+        .map(|joined| {
+            joined
+                .keys()
+                .filter_map(|k| k.parse::<OwnedUserId>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if members.is_empty() {
+        anyhow::bail!("joined_members returned no members for {room_id}");
+    }
+    ctx.rooms.cache_members(room_id, members.clone()).await;
+    Ok(members)
+}
+
+/// History visibility for room key sharing; tracked from sync, fetched on
+/// demand otherwise, defaulting to the spec default (shared).
+pub async fn history_visibility_or_fetch(
+    ctx: &AccountContext,
+    room_id: &RoomId,
+) -> HistoryVisibility {
+    if let Some(v) = ctx.rooms.history_visibility(room_id).await {
+        return v;
+    }
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/state/m.room.history_visibility",
+        crate::crypto::machine::enc(room_id.as_str())
+    );
+    let visibility = match ctx
+        .upstream
+        .json_request(reqwest::Method::GET, &path, &ctx.token, None)
+        .await
+    {
+        Ok((status, body)) if status.is_success() => body
+            .get("history_visibility")
+            .and_then(|v| v.as_str())
+            .map(HistoryVisibility::from)
+            .unwrap_or(HistoryVisibility::Shared),
+        _ => HistoryVisibility::Shared,
+    };
+    ctx.rooms
+        .history_visibility
+        .write()
+        .await
+        .insert(room_id.to_owned(), visibility.clone());
+    visibility
+}
+
 /// Parse an m.room.encryption event's content into RoomSettings.
 pub fn room_settings_from_content(content: &serde_json::Value) -> Option<RoomSettings> {
     let algorithm = content.get("algorithm")?.as_str()?;

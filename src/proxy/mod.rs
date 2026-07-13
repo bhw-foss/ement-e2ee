@@ -95,6 +95,17 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
                 None => passthrough(&state, req).await,
             }
         }
+        Route::Send {
+            room_id,
+            event_type,
+            txn_id,
+        } => match context_for(&state, token).await {
+            Some(ctx) => {
+                crate::crypto::encrypt::handle_send(&state, ctx, req, room_id, event_type, txn_id)
+                    .await
+            }
+            None => passthrough(&state, req).await,
+        },
         // Interception for send + media lands in later milestones; everything
         // else passes through unchanged.
         _ => passthrough(&state, req).await,

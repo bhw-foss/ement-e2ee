@@ -69,7 +69,7 @@ pub async fn pump(ctx: &AccountContext) {
     }
 }
 
-fn enc(segment: &str) -> String {
+pub(crate) fn enc(segment: &str) -> String {
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     const SAFE: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
         .remove(b'-')
