@@ -112,6 +112,49 @@ pub fn decrypt_attachment(data: &[u8], info: MediaEncryptionInfo) -> anyhow::Res
     Ok(decrypted)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_round_trip() {
+        let data = b"hello encrypted world".to_vec();
+        let (encrypted, info) = encrypt_attachment(&data).unwrap();
+        assert_ne!(encrypted, data);
+        let decrypted = decrypt_attachment(&encrypted, info).unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn cache_round_trip() {
+        let dir = std::env::temp_dir().join(format!("ement-e2ee-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = MediaKeyCache::open(&dir.join("media.sqlite")).unwrap();
+
+        let (_, info) = encrypt_attachment(b"data").unwrap();
+        cache
+            .insert("mxc://example.org/abc", &info, Some("image/png"), Some("cat.png"))
+            .unwrap();
+
+        let entry = cache.get("mxc://example.org/abc").unwrap();
+        assert_eq!(entry.mimetype.as_deref(), Some("image/png"));
+        assert_eq!(entry.filename.as_deref(), Some("cat.png"));
+        assert!(cache.get("mxc://example.org/missing").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn encrypted_room_content_rewrite_shape() {
+        // MediaEncryptionInfo must serialize to the spec `file` object minus url.
+        let (_, info) = encrypt_attachment(b"data").unwrap();
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["v"], "v2");
+        assert!(value["key"]["k"].is_string());
+        assert!(value["iv"].is_string());
+        assert!(value["hashes"]["sha256"].is_string());
+    }
+}
+
 /// Intercept POST /_matrix/media/*/upload: encrypt the payload, upload the
 /// ciphertext (as octet-stream, without the filename), remember the key.
 pub async fn handle_upload(

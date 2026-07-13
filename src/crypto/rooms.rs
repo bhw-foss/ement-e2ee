@@ -190,6 +190,39 @@ pub fn room_settings_from_content(content: &serde_json::Value) -> Option<RoomSet
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_encryption_content() {
+        let settings = room_settings_from_content(&serde_json::json!({
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "rotation_period_ms": 604800000u64,
+            "rotation_period_msgs": 100,
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.algorithm,
+            EventEncryptionAlgorithm::MegolmV1AesSha2
+        );
+        assert_eq!(
+            settings.session_rotation_period,
+            Some(Duration::from_millis(604800000))
+        );
+        assert_eq!(settings.session_rotation_period_messages, Some(100));
+
+        // Defaults: only algorithm is required.
+        let settings =
+            room_settings_from_content(&serde_json::json!({"algorithm": "m.megolm.v1.aes-sha2"}))
+                .unwrap();
+        assert_eq!(settings.session_rotation_period, None);
+
+        // Missing algorithm -> None.
+        assert!(room_settings_from_content(&serde_json::json!({})).is_none());
+    }
+}
+
 /// Scan state events (from sync `state.events`, timeline state events, or
 /// /messages `state`) for room metadata the proxy cares about.
 pub async fn scan_state_events(

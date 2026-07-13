@@ -198,6 +198,37 @@ fn utd_placeholder(original: &Value, reason: &str, session_id: Option<&str>) -> 
     placeholder
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utd_placeholder_preserves_envelope() {
+        let original = json!({
+            "type": "m.room.encrypted",
+            "event_id": "$abc",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1234,
+            "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "..."},
+            "unsigned": {"transaction_id": "1-999", "age": 5},
+        });
+        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"));
+        assert_eq!(placeholder["type"], "m.room.message");
+        assert_eq!(placeholder["event_id"], "$abc");
+        assert_eq!(placeholder["sender"], "@alice:example.org");
+        assert_eq!(placeholder["origin_server_ts"], 1234);
+        // ement's local-echo resolution needs transaction_id to survive.
+        assert_eq!(placeholder["unsigned"]["transaction_id"], "1-999");
+        assert_eq!(placeholder["unsigned"]["ement_e2ee"]["utd"], true);
+        assert!(
+            placeholder["content"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("MissingRoomKey")
+        );
+    }
+}
+
 /// Ask other own-devices / original sender for the missing room key, once per
 /// megolm session.
 async fn maybe_request_room_key(

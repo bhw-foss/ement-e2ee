@@ -23,6 +23,27 @@ pub enum CtlCommand {
         #[command(subcommand)]
         action: VerifyAction,
     },
+    /// Export/import room keys as a passphrase-protected file (Element-compatible).
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeysAction {
+    /// Export all room keys to FILE.
+    Export {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        user_id: Option<String>,
+    },
+    /// Import room keys from FILE.
+    Import {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        user_id: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -115,6 +136,43 @@ pub async fn run(args: CtlArgs) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         CtlCommand::Verify { action } => run_verify(&client, action).await?,
+        CtlCommand::Keys { action } => run_keys(&client, action).await?,
+    }
+    Ok(())
+}
+
+async fn run_keys(client: &Client, action: KeysAction) -> anyhow::Result<()> {
+    match action {
+        KeysAction::Export { file, user_id } => {
+            let passphrase = rpassword::prompt_password("Passphrase to protect the export: ")?;
+            let mut body = serde_json::json!({ "passphrase": passphrase });
+            if let Some(user_id) = user_id {
+                body["user_id"] = user_id.into();
+            }
+            let resp = client.post("keys/export", &body).await?;
+            let export = resp
+                .get("export")
+                .and_then(|v| v.as_str())
+                .context("malformed export response")?;
+            std::fs::write(&file, export)
+                .with_context(|| format!("failed to write {}", file.display()))?;
+            println!(
+                "Exported {} room keys to {}",
+                resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                file.display()
+            );
+        }
+        KeysAction::Import { file, user_id } => {
+            let data = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            let passphrase = rpassword::prompt_password("Export passphrase: ")?;
+            let mut body = serde_json::json!({ "passphrase": passphrase, "data": data });
+            if let Some(user_id) = user_id {
+                body["user_id"] = user_id.into();
+            }
+            let resp = client.post("keys/import", &body).await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
     }
     Ok(())
 }

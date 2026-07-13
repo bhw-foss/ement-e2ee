@@ -47,6 +47,18 @@ pub async fn handle_sync(
     let bytes = upstream_resp.bytes().await?;
 
     if !status.is_success() {
+        // A dead token means this context is stale; evict so a future token
+        // re-initializes cleanly (the on-disk stores are preserved).
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("errcode").and_then(|c| c.as_str()).map(ToOwned::to_owned))
+                .as_deref()
+                == Some("M_UNKNOWN_TOKEN")
+        {
+            tracing::info!(user_id = %ctx.user_id, "access token invalidated; evicting session");
+            state.sessions.remove(&ctx.token).await;
+        }
         return raw_response(status.as_u16(), content_type, bytes.to_vec());
     }
 

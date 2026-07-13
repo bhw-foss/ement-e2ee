@@ -1,0 +1,19 @@
+# ement-e2ee configuration — copy to ~/.config/ement-e2ee/config.toml
+
+# Where the proxy listens; point (ement-connect :uri-prefix ...) here.
+listen = "127.0.0.1:8009"
+
+# Your real homeserver (the client-server API base URL).
+homeserver = "https://matrix.example.org"
+
+# Where crypto stores and media key caches live.
+# store_dir = "~/.local/share/ement-e2ee"   # default
+
+# tracing filter: error | warn | info | debug | trace, or e.g. "ement_e2ee=debug"
+# log_level = "info"
+
+# Optional: encrypt the sqlite crypto store with this passphrase.
+# store_passphrase = "..."
+
+# Optional: require `Authorization: Bearer <token>` on the /_ement admin API.
+# admin_token = "..."

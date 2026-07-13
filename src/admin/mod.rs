@@ -45,6 +45,14 @@ pub async fn handle(state: &AppState, sub: &str, req: Request) -> Result<Respons
             let body = read_json_body(req).await?;
             bootstrap(state, body).await
         }
+        ("POST", ["keys", "export"]) => {
+            let body = read_json_body(req).await?;
+            keys_export(state, body).await
+        }
+        ("POST", ["keys", "import"]) => {
+            let body = read_json_body(req).await?;
+            keys_import(state, body).await
+        }
         ("GET", ["verify"]) => {
             let (ctx, with_user) = match verify_target(state, &query).await {
                 Ok(t) => t,
@@ -228,6 +236,65 @@ async fn status(state: &AppState) -> Result<Response, ProxyError> {
         "sessions": sessions,
     });
     Ok(Json(body).into_response())
+}
+
+/// Export all room keys as a passphrase-protected blob (spec key-export
+/// format, importable by Element too).
+async fn keys_export(state: &AppState, body: serde_json::Value) -> Result<Response, ProxyError> {
+    let Some(passphrase) = body.get("passphrase").and_then(|v| v.as_str()) else {
+        return Ok(json_error(StatusCode::BAD_REQUEST, "missing passphrase"));
+    };
+    let ctx = match resolve_session(state, body.get("user_id").and_then(|v| v.as_str())).await {
+        Ok(ctx) => ctx,
+        Err(response) => return Ok(response),
+    };
+    let keys = ctx
+        .olm
+        .store()
+        .export_room_keys(|_| true)
+        .await
+        .map_err(|e| ProxyError::Internal(e.into()))?;
+    let count = keys.len();
+    let export = matrix_sdk_crypto::encrypt_room_key_export(&keys, passphrase, 100_000)
+        .map_err(|e| ProxyError::Internal(e.into()))?;
+    Ok(Json(serde_json::json!({ "count": count, "export": export })).into_response())
+}
+
+/// Import room keys from a passphrase-protected export blob.
+async fn keys_import(state: &AppState, body: serde_json::Value) -> Result<Response, ProxyError> {
+    let (Some(passphrase), Some(data)) = (
+        body.get("passphrase").and_then(|v| v.as_str()),
+        body.get("data").and_then(|v| v.as_str()),
+    ) else {
+        return Ok(json_error(
+            StatusCode::BAD_REQUEST,
+            "missing passphrase or data",
+        ));
+    };
+    let ctx = match resolve_session(state, body.get("user_id").and_then(|v| v.as_str())).await {
+        Ok(ctx) => ctx,
+        Err(response) => return Ok(response),
+    };
+    let keys = match matrix_sdk_crypto::decrypt_room_key_export(data.as_bytes(), passphrase) {
+        Ok(keys) => keys,
+        Err(e) => {
+            return Ok(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("could not decrypt export: {e}"),
+            ));
+        }
+    };
+    let result = ctx
+        .olm
+        .store()
+        .import_room_keys(keys, None, |_, _| {})
+        .await
+        .map_err(|e| ProxyError::Internal(e.into()))?;
+    Ok(Json(serde_json::json!({
+        "imported": result.imported_count,
+        "total": result.total_count,
+    }))
+    .into_response())
 }
 
 async fn bootstrap(state: &AppState, body: serde_json::Value) -> Result<Response, ProxyError> {

@@ -63,7 +63,7 @@ pub async fn pump(ctx: &AccountContext) {
             }
         };
         if requests.is_empty() {
-            return;
+            break;
         }
         for request in requests {
             if let Err(e) = send_and_mark(ctx, &request).await {
@@ -76,6 +76,48 @@ pub async fn pump(ctx: &AccountContext) {
             }
         }
     }
+    // With the queue drained, push any new room keys to the server-side
+    // backup (no-op unless `ctl bootstrap` enabled backups).
+    if let Err(e) = upload_pending_backups(ctx).await {
+        tracing::warn!(error = ?e, "backup upload failed; will retry on next pump");
+    }
+}
+
+/// Encrypt-and-upload not-yet-backed-up room keys, mirroring matrix-sdk's
+/// `Backups::backup_room_keys`.
+async fn upload_pending_backups(ctx: &AccountContext) -> anyhow::Result<()> {
+    let backup_machine = ctx.olm.backup_machine();
+    if !backup_machine.enabled().await {
+        return Ok(());
+    }
+    // Bounded loop: each `backup()` call returns one batch.
+    for _ in 0..100 {
+        let Some((txn_id, request)) = backup_machine.backup().await? else {
+            return Ok(());
+        };
+        let path = format!(
+            "/_matrix/client/v3/room_keys/keys?version={}",
+            enc(&request.version)
+        );
+        let body = serde_json::json!({ "rooms": request.rooms });
+        let (status, response_body) = ctx
+            .upstream
+            .json_request(reqwest::Method::PUT, &path, &ctx.token, Some(&body))
+            .await?;
+        if !status.is_success() {
+            anyhow::bail!("room_keys upload returned {status}: {response_body}");
+        }
+        let http_response = http::Response::builder()
+            .status(200)
+            .body(serde_json::to_vec(&response_body)?)?;
+        let response =
+            ruma::api::client::backup::add_backup_keys::v3::Response::try_from_http_response(
+                http_response,
+            )?;
+        ctx.olm.mark_request_as_sent(&txn_id, &response).await?;
+        tracing::debug!("uploaded a batch of room keys to backup");
+    }
+    Ok(())
 }
 
 pub(crate) fn enc(segment: &str) -> String {
