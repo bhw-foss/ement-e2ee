@@ -5,3 +5,4 @@ pub mod machine;
 pub mod rooms;
 pub mod ssss;
 pub mod sync;
+pub mod verify;

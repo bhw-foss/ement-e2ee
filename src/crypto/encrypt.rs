@@ -143,6 +143,53 @@ async fn encrypt_content(
     Ok(value)
 }
 
+/// Send a RoomMessageRequest produced by the verification machine, encrypting
+/// it when the target room is encrypted, and feed the response back.
+pub(crate) async fn send_room_message_request(
+    ctx: &Arc<AccountContext>,
+    request: &matrix_sdk_crypto::types::requests::RoomMessageRequest,
+) -> anyhow::Result<()> {
+    use ruma::api::IncomingResponse as _;
+    use ruma::events::MessageLikeEventContent as _;
+
+    let event_type = request.content.event_type().to_string();
+    let content = serde_json::to_value(&request.content)?;
+
+    let (wire_type, wire_content) = if rooms::is_room_encrypted(ctx, &request.room_id).await? {
+        (
+            "m.room.encrypted".to_owned(),
+            encrypt_content(ctx, &request.room_id, &event_type, content).await?,
+        )
+    } else {
+        (event_type, content)
+    };
+
+    let path = format!(
+        "/_matrix/client/v3/rooms/{}/send/{}/{}",
+        machine::enc(request.room_id.as_str()),
+        machine::enc(&wire_type),
+        machine::enc(request.txn_id.as_str())
+    );
+    let (status, response_body) = ctx
+        .upstream
+        .json_request(reqwest::Method::PUT, &path, &ctx.token, Some(&wire_content))
+        .await?;
+    if !status.is_success() {
+        anyhow::bail!("in-room verification send failed: {status} {response_body}");
+    }
+    let http_response = http::Response::builder()
+        .status(200)
+        .body(serde_json::to_vec(&response_body)?)?;
+    let response =
+        ruma::api::client::message::send_message_event::v3::Response::try_from_http_response(
+            http_response,
+        )?;
+    ctx.olm
+        .mark_request_as_sent(&request.txn_id, &response)
+        .await?;
+    Ok(())
+}
+
 /// Build EncryptionSettings from the room's persisted settings and history
 /// visibility.
 async fn encryption_settings(

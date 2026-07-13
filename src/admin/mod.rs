@@ -37,16 +37,118 @@ pub async fn handle(state: &AppState, sub: &str, req: Request) -> Result<Respons
     }
 
     let method = req.method().clone();
-    match (method.as_str(), sub) {
-        ("GET", "status") => status(state).await,
-        ("POST", "bootstrap") => {
+    let query = parse_query(req.uri().query());
+    let parts: Vec<&str> = sub.split('/').filter(|s| !s.is_empty()).collect();
+    match (method.as_str(), parts.as_slice()) {
+        ("GET", ["status"]) => status(state).await,
+        ("POST", ["bootstrap"]) => {
             let body = read_json_body(req).await?;
             bootstrap(state, body).await
+        }
+        ("GET", ["verify"]) => {
+            let (ctx, with_user) = match verify_target(state, &query).await {
+                Ok(t) => t,
+                Err(response) => return Ok(response),
+            };
+            Ok(Json(crate::crypto::verify::list(&ctx, &with_user).await).into_response())
+        }
+        ("POST", ["verify", "start"]) => {
+            let body = read_json_body(req).await?;
+            let params = json_params(&body);
+            let (ctx, _) = match verify_target(state, &params).await {
+                Ok(t) => t,
+                Err(response) => return Ok(response),
+            };
+            let Some(device_id) = params.get("device_id").cloned() else {
+                return Ok(json_error(StatusCode::BAD_REQUEST, "missing device_id"));
+            };
+            verify_result(crate::crypto::verify::start(&ctx, &device_id).await)
+        }
+        ("GET", ["verify", flow]) => {
+            let flow = (*flow).to_owned();
+            let (ctx, with_user) = match verify_target(state, &query).await {
+                Ok(t) => t,
+                Err(response) => return Ok(response),
+            };
+            verify_result(crate::crypto::verify::show(&ctx, &with_user, &flow).await)
+        }
+        ("POST", ["verify", flow, action]) => {
+            let flow = (*flow).to_owned();
+            let action = (*action).to_owned();
+            let body = read_json_body(req).await?;
+            let params = json_params(&body);
+            let (ctx, with_user) = match verify_target(state, &params).await {
+                Ok(t) => t,
+                Err(response) => return Ok(response),
+            };
+            use crate::crypto::verify;
+            let result = match action.as_str() {
+                "accept" => verify::accept(&ctx, &with_user, &flow).await,
+                "start-sas" => verify::start_sas(&ctx, &with_user, &flow).await,
+                "sas-accept" => verify::sas_accept(&ctx, &with_user, &flow).await,
+                "confirm" => verify::confirm(&ctx, &with_user, &flow).await,
+                "cancel" => verify::cancel(&ctx, &with_user, &flow).await,
+                _ => {
+                    return Ok(json_error(
+                        StatusCode::NOT_FOUND,
+                        format!("unknown verify action: {action}"),
+                    ));
+                }
+            };
+            verify_result(result)
         }
         _ => Ok(json_error(
             StatusCode::NOT_FOUND,
             format!("unknown admin route: {method} {sub}"),
         )),
+    }
+}
+
+fn parse_query(query: Option<&str>) -> std::collections::HashMap<String, String> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_owned(), v.to_owned()))
+        })
+        .collect()
+}
+
+fn json_params(body: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    body.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the session and the "other user" of a verification from request
+/// parameters (`user_id` selects the session, `with_user` the counterpart;
+/// both default sensibly for the single-account own-device case).
+async fn verify_target(
+    state: &AppState,
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(Arc<AccountContext>, ruma::OwnedUserId), Response> {
+    let ctx = resolve_session(state, params.get("user_id").map(String::as_str)).await?;
+    let with_user = match params.get("with_user") {
+        Some(user) => user.parse().map_err(|_| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid with_user: {user}"),
+            )
+        })?,
+        None => ctx.user_id.clone(),
+    };
+    Ok((ctx, with_user))
+}
+
+fn verify_result(result: anyhow::Result<serde_json::Value>) -> Result<Response, ProxyError> {
+    match result {
+        Ok(value) => Ok(Json(value).into_response()),
+        Err(e) => Ok(json_error(StatusCode::CONFLICT, format!("{e:#}"))),
     }
 }
 

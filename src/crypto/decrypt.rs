@@ -130,6 +130,7 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
                 );
             }
 
+            maybe_feed_verification(ctx, &new_event).await;
             *event = new_event;
         }
         Ok(RoomEventDecryptionResult::UnableToDecrypt(info)) => {
@@ -141,6 +142,27 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
         Err(e) => {
             tracing::error!(error = ?e, "decryption failed with store error");
         }
+    }
+}
+
+/// Feed decrypted in-room verification events to the verification machine so
+/// `ctl verify` also works for in-room (other-user DM) flows.
+async fn maybe_feed_verification(ctx: &Arc<AccountContext>, event: &Value) {
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+    let is_verification = event_type.starts_with("m.key.verification.")
+        || (event_type == "m.room.message"
+            && event.pointer("/content/msgtype").and_then(|v| v.as_str())
+                == Some("m.key.verification.request"));
+    if !is_verification {
+        return;
+    }
+    match serde_json::from_value::<ruma::events::AnyMessageLikeEvent>(event.clone()) {
+        Ok(parsed) => {
+            if let Err(e) = ctx.olm.receive_verification_event(&parsed).await {
+                tracing::warn!(error = ?e, "receive_verification_event failed");
+            }
+        }
+        Err(e) => tracing::debug!(error = ?e, "unparsable in-room verification event"),
     }
 }
 

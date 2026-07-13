@@ -18,6 +18,74 @@ pub enum CtlCommand {
         #[arg(long)]
         recovery_key_file: Option<std::path::PathBuf>,
     },
+    /// Interactive (emoji/SAS) device verification.
+    Verify {
+        #[command(subcommand)]
+        action: VerifyAction,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct VerifyCommon {
+    /// Act on this user's session (needed only with multiple accounts).
+    #[arg(long)]
+    user_id: Option<String>,
+    /// The other user of the verification (defaults to your own user, i.e.
+    /// verifying one of your own devices).
+    #[arg(long)]
+    with_user: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum VerifyAction {
+    /// List verification flows.
+    List {
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Request verification of one of your own devices (e.g. Element).
+    Start {
+        /// The device ID to verify with (see Element: Settings > Sessions).
+        device: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Show a flow's state, including the emoji once SAS is running.
+    Show {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Accept an incoming verification request.
+    Accept {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Transition an accepted flow into emoji (SAS) verification.
+    StartSas {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Accept a SAS the other side started.
+    SasAccept {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Confirm that the emoji match.
+    Confirm {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
+    /// Cancel a flow.
+    Cancel {
+        flow: String,
+        #[command(flatten)]
+        common: VerifyCommon,
+    },
 }
 
 pub async fn run(args: CtlArgs) -> anyhow::Result<()> {
@@ -45,6 +113,98 @@ pub async fn run(args: CtlArgs) -> anyhow::Result<()> {
             }
             let resp = client.post("bootstrap", &body).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        CtlCommand::Verify { action } => run_verify(&client, action).await?,
+    }
+    Ok(())
+}
+
+fn common_body(common: &VerifyCommon) -> serde_json::Value {
+    let mut body = serde_json::json!({});
+    if let Some(user_id) = &common.user_id {
+        body["user_id"] = user_id.clone().into();
+    }
+    if let Some(with_user) = &common.with_user {
+        body["with_user"] = with_user.clone().into();
+    }
+    body
+}
+
+fn common_query(common: &VerifyCommon) -> String {
+    let mut parts = Vec::new();
+    if let Some(user_id) = &common.user_id {
+        parts.push(format!("user_id={user_id}"));
+    }
+    if let Some(with_user) = &common.with_user {
+        parts.push(format!("with_user={with_user}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+fn print_flow(value: &serde_json::Value) {
+    // Emoji first and prominently, if present.
+    if let Some(formatted) = value.pointer("/sas/emoji/formatted").and_then(|v| v.as_str()) {
+        println!("\nCompare these emoji with the other device:\n");
+        println!("{formatted}\n");
+    }
+    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+}
+
+async fn run_verify(client: &Client, action: VerifyAction) -> anyhow::Result<()> {
+    match action {
+        VerifyAction::List { common } => {
+            let resp = client.get(&format!("verify{}", common_query(&common))).await?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        VerifyAction::Start { device, common } => {
+            let mut body = common_body(&common);
+            body["device_id"] = device.into();
+            let resp = client.post("verify/start", &body).await?;
+            print_flow(&resp);
+            println!("\nNow accept the request on the other device, then run:");
+            if let Some(flow) = resp.get("flow_id").and_then(|v| v.as_str()) {
+                println!("  ement-e2ee ctl verify show {flow}");
+            }
+        }
+        VerifyAction::Show { flow, common } => {
+            let resp = client
+                .get(&format!("verify/{flow}{}", common_query(&common)))
+                .await?;
+            print_flow(&resp);
+        }
+        VerifyAction::Accept { flow, common } => {
+            let resp = client
+                .post(&format!("verify/{flow}/accept"), &common_body(&common))
+                .await?;
+            print_flow(&resp);
+        }
+        VerifyAction::StartSas { flow, common } => {
+            let resp = client
+                .post(&format!("verify/{flow}/start-sas"), &common_body(&common))
+                .await?;
+            print_flow(&resp);
+        }
+        VerifyAction::SasAccept { flow, common } => {
+            let resp = client
+                .post(&format!("verify/{flow}/sas-accept"), &common_body(&common))
+                .await?;
+            print_flow(&resp);
+        }
+        VerifyAction::Confirm { flow, common } => {
+            let resp = client
+                .post(&format!("verify/{flow}/confirm"), &common_body(&common))
+                .await?;
+            print_flow(&resp);
+        }
+        VerifyAction::Cancel { flow, common } => {
+            let resp = client
+                .post(&format!("verify/{flow}/cancel"), &common_body(&common))
+                .await?;
+            print_flow(&resp);
         }
     }
     Ok(())
