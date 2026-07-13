@@ -1,3 +1,4 @@
+pub mod intercept;
 pub mod login;
 pub mod passthrough;
 pub mod routes;
@@ -88,8 +89,14 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
             Some(ctx) => crate::crypto::sync::handle_sync(&state, ctx, req).await,
             None => passthrough(&state, req).await,
         },
-        // Interception for send/messages/context/event/media lands in later
-        // milestones; everything else passes through unchanged.
+        route @ (Route::Messages { .. } | Route::Context { .. } | Route::RoomEvent { .. }) => {
+            match context_for(&state, token).await {
+                Some(ctx) => intercept::handle_history_get(&state, ctx, req, route).await,
+                None => passthrough(&state, req).await,
+            }
+        }
+        // Interception for send + media lands in later milestones; everything
+        // else passes through unchanged.
         _ => passthrough(&state, req).await,
     }
 }

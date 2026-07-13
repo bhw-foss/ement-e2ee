@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use axum::body::Body;
 use axum::extract::Request;
 use axum::http::header;
 use axum::response::Response;
@@ -15,6 +14,7 @@ use ruma::{OneTimeKeyAlgorithm, UInt};
 use crate::crypto::machine;
 use crate::error::ProxyError;
 use crate::proxy::AppState;
+use crate::proxy::intercept::raw_response;
 use crate::session::AccountContext;
 
 /// Intercept GET /sync: forward verbatim, feed the crypto-relevant sections
@@ -55,9 +55,10 @@ pub async fn handle_sync(
 
     receive_sync_changes(&ctx, &body).await?;
 
-    // Rewrite pass (decryption of m.room.encrypted timeline events, room
-    // state tracking) — filled in by the receive path.
-    process_sync_body(&ctx, &mut body).await;
+    // Rewrite pass: track room encryption state and decrypt m.room.encrypted
+    // timeline events. Must run after receive_sync_changes so room keys from
+    // this very sync are usable.
+    crate::crypto::decrypt::process_sync_body(&ctx, &mut body).await;
 
     // Pump *after* receive_sync_changes: sync may have queued key uploads,
     // key queries for changed devices, etc. Fire and forget.
@@ -133,20 +134,3 @@ async fn receive_sync_changes(
     Ok(())
 }
 
-/// Placeholder for the receive-path rewrite (M3): decrypt encrypted timeline
-/// events and track room encryption state.
-async fn process_sync_body(_ctx: &AccountContext, _body: &mut serde_json::Value) {}
-
-fn raw_response(
-    status: u16,
-    content_type: Option<header::HeaderValue>,
-    bytes: Vec<u8>,
-) -> Result<Response, ProxyError> {
-    let mut builder = Response::builder().status(status);
-    if let Some(ct) = content_type {
-        builder = builder.header(header::CONTENT_TYPE, ct);
-    }
-    builder
-        .body(Body::from(bytes))
-        .map_err(|e| ProxyError::Internal(e.into()))
-}

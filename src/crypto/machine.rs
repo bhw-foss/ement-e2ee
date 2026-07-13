@@ -87,7 +87,10 @@ fn to_device_path(request: &ToDeviceRequest) -> String {
     )
 }
 
-async fn send_and_mark(ctx: &AccountContext, request: &OutgoingRequest) -> anyhow::Result<()> {
+pub(crate) async fn send_and_mark(
+    ctx: &AccountContext,
+    request: &OutgoingRequest,
+) -> anyhow::Result<()> {
     use reqwest::Method;
 
     let (method, path, body): (Method, String, serde_json::Value) = match request.request() {
