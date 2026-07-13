@@ -59,16 +59,32 @@ cargo install --path .   # puts ement-e2ee on ~/.cargo/bin
    $EDITOR ~/.config/ement-e2ee/config.toml   # set homeserver
    ```
 
-2. Run the proxy (`contrib/ement-e2ee.service` for systemd):
+2. Run the proxy — either directly:
 
    ```sh
    ement-e2ee serve
    ```
 
+   or as a systemd user service:
+
+   ```sh
+   install -Dm644 contrib/ement-e2ee.service ~/.config/systemd/user/ement-e2ee.service
+   systemctl --user daemon-reload
+   systemctl --user enable --now ement-e2ee
+   journalctl --user -u ement-e2ee -f    # follow the logs
+   ```
+
+   The unit expects the binary at `~/.cargo/bin/ement-e2ee` (where
+   `cargo install` puts it) and starts on login. On WSL2, enable systemd
+   first: add `[boot] systemd=true` to `/etc/wsl.conf`, then restart the
+   distro (`wsl.exe --shutdown`). To keep the proxy alive without an open
+   session, `loginctl enable-linger $USER`.
+
 3. Connect ement through it:
 
    ```elisp
    (ement-connect :user-id "@you:example.org"
+                  :password "yourpass"
                   :uri-prefix "http://localhost:8009")
    ```
 
