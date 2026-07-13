@@ -1,0 +1,32 @@
+[package]
+name = "ement-e2ee"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Transparent E2EE proxy for ement.el, built on matrix-sdk-crypto"
+license = "Apache-2.0"
+
+[dependencies]
+matrix-sdk-crypto = { path = "../matrix-rust-sdk/crates/matrix-sdk-crypto", features = ["automatic-room-key-forwarding"] }
+matrix-sdk-sqlite = { path = "../matrix-rust-sdk/crates/matrix-sdk-sqlite", default-features = false, features = ["crypto-store", "bundled"] }
+# Must stay on the exact rev pinned by the matrix-rust-sdk workspace so types unify.
+ruma = { git = "https://github.com/ruma/ruma", rev = "a494c58c541c63042b26380a9238a24bdda4d85c", features = ["client-api-c", "rand"] }
+
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "rustls-native-certs", "charset", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+rpassword = "7"
+dirs = "6"
+http = "1"
+futures-util = "0.3"
+toml = "0.8"
+bytes = "1"
+percent-encoding = "2"
