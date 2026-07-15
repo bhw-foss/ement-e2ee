@@ -40,9 +40,10 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
 
 ## Build
 
-Requires Rust ≥ 1.93 (`rustup` recommended) and a checkout of
-[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) at
-`../matrix-rust-sdk` (path dependencies).
+Requires Rust ≥ 1.93 (`rustup` recommended). The
+[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) crates are
+pulled in as git dependencies pinned to a fixed rev, so no local checkout is
+needed — `cargo` fetches them on first build.
 
 ```sh
 cargo build --release
