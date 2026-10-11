@@ -6,7 +6,6 @@
 use anyhow::Context as _;
 use matrix_sdk_crypto::secret_storage::{AesHmacSha2EncryptedData, SecretStorageKey};
 use matrix_sdk_crypto::store::types::CrossSigningKeyExport;
-use ruma::api::IncomingResponse as _;
 use ruma::api::client::keys::get_keys::v3::Response as KeysQueryResponse;
 use ruma::events::EventContentFromType as _;
 use ruma::events::secret::request::SecretName;
@@ -122,10 +121,7 @@ async fn query_own_keys(ctx: &AccountContext) -> anyhow::Result<()> {
     if !status.is_success() {
         anyhow::bail!("keys/query failed: {status} {response_body}");
     }
-    let http_response = http::Response::builder()
-        .status(200)
-        .body(serde_json::to_vec(&response_body)?)?;
-    let response = KeysQueryResponse::try_from_http_response(http_response)?;
+    let response: KeysQueryResponse = machine::parse_response(&response_body)?;
     ctx.olm.mark_request_as_sent(&request_id, &response).await?;
     Ok(())
 }

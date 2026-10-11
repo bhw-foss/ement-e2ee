@@ -89,7 +89,10 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
             Some(ctx) => crate::crypto::sync::handle_sync(&state, ctx, req).await,
             None => passthrough(&state, req).await,
         },
-        route @ (Route::Messages { .. } | Route::Context { .. } | Route::RoomEvent { .. }) => {
+        route @ (Route::Messages { .. }
+        | Route::Context { .. }
+        | Route::RoomEvent { .. }
+        | Route::Notifications) => {
             match context_for(&state, token).await {
                 Some(ctx) => intercept::handle_history_get(&state, ctx, req, route).await,
                 None => passthrough(&state, req).await,
@@ -131,5 +134,42 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
         }
         // Everything else passes through unchanged.
         _ => passthrough(&state, req).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(uri: &str, authorization: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(value) = authorization {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn bearer_token_from_header_or_query() {
+        let req = request("/_matrix/client/r0/sync", Some("Bearer syt_abc"));
+        assert_eq!(bearer_token(&req).as_deref(), Some("syt_abc"));
+
+        // Legacy clients pass the token in the query string.
+        let req = request("/_matrix/client/r0/sync?timeout=0&access_token=syt_q", None);
+        assert_eq!(bearer_token(&req).as_deref(), Some("syt_q"));
+
+        // The header wins when both are present.
+        let req = request("/sync?access_token=query", Some("Bearer header"));
+        assert_eq!(bearer_token(&req).as_deref(), Some("header"));
+    }
+
+    #[test]
+    fn bearer_token_absent_or_unusable() {
+        assert_eq!(bearer_token(&request("/sync", None)), None);
+        assert_eq!(bearer_token(&request("/sync?timeout=0", None)), None);
+        // Other auth schemes are not access tokens.
+        assert_eq!(bearer_token(&request("/sync", Some("Basic dXNlcjpwYXNz"))), None);
+        // A parameter that merely ends in the same name is not the token.
+        assert_eq!(bearer_token(&request("/sync?not_access_token=x", None)), None);
     }
 }

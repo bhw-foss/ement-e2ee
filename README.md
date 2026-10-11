@@ -21,8 +21,8 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
 ## Features
 
 - **Receive**: decrypts `m.room.encrypted` events in `/sync`, `/messages`,
-  `/context`, and `/event` responses; undecryptable events render as a
-  readable placeholder and trigger an automatic room-key request.
+  `/context`, `/event`, and `/notifications` responses; undecryptable events
+  render as a readable placeholder and trigger an automatic room-key request.
 - **Send**: transparently encrypts everything sent into encrypted rooms
   (messages, edits, reactions), including establishing olm sessions and
   sharing megolm keys with full (not lazy-loaded) room membership.
@@ -40,10 +40,9 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
 
 ## Build
 
-Requires Rust ≥ 1.93 (`rustup` recommended). The
-[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) crates are
-pulled in as git dependencies pinned to a fixed rev, so no local checkout is
-needed — `cargo` fetches them on first build.
+Requires Rust ≥ 1.96 (`rustup` recommended). All dependencies, including the
+[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) crates, are
+released versions from crates.io, locked by `Cargo.lock`.
 
 ```sh
 cargo build --release
@@ -149,7 +148,7 @@ in the config if localhost isn't trustworthy enough for you.
 `~/.local/share/ement-e2ee/{user}/{device}/`:
 
 - `matrix-sdk-crypto.sqlite3` — olm account, sessions, room keys, trust state
-  (optionally encrypted with `store_passphrase`).
+    (optionally encrypted with `store_passphrase`).
 - `media.sqlite` — mxc → attachment encryption keys (needed to decrypt media
   you've received/sent; deleting it makes old encrypted media undownloadable
   until re-fetched keys arrive by other means).
@@ -161,7 +160,13 @@ changed device. Prefer keeping it; back it up if you care.
 ## Development
 
 ```sh
-cargo test          # unit tests (route classifier, rewrites, media crypto)
+cargo test          # unit tests plus end-to-end tests (see below)
 cargo run -- serve --homeserver https://matrix.org --log-level debug
 curl http://127.0.0.1:8009/_matrix/client/versions   # smoke test
 ```
+
+The end-to-end tests (`src/e2e_tests.rs`) run real matrix-sdk-crypto machines
+through the proxy against an in-process fake homeserver (`src/testutil.rs`),
+over loopback HTTP: message round trips, `/notifications` and history
+decryption, media, key export/import, `ctl bootstrap` (SSSS, cross-signing,
+backup restore) and `ctl verify` (SAS). They need no network or account.

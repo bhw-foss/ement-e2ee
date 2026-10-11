@@ -60,8 +60,8 @@ pub async fn forward_get_json(
     Ok(Ok((content_type, body)))
 }
 
-/// Intercept history-fetching GETs (/messages, /context/{e}, /event/{e}) and
-/// decrypt any m.room.encrypted events in the response.
+/// Intercept event-returning GETs (/messages, /context/{e}, /event/{e},
+/// /notifications) and decrypt any m.room.encrypted events in the response.
 pub async fn handle_history_get(
     state: &AppState,
     ctx: Arc<AccountContext>,
@@ -89,7 +89,9 @@ pub async fn handle_history_get(
         _ => None,
     };
 
-    if let Some(room_id) = room_id {
+    if route == Route::Notifications {
+        decrypt::process_notifications_body(&ctx, &mut body).await;
+    } else if let Some(room_id) = room_id {
         match route {
             Route::Messages { .. } => {
                 decrypt::process_messages_body(&ctx, &room_id, &mut body).await

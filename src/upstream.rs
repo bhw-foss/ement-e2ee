@@ -21,16 +21,19 @@ impl Upstream {
         Ok(Self { base, http })
     }
 
-    /// Join a path (with optional query) onto the homeserver base URL.
+    /// Put a path (with optional query) onto the homeserver base URL.
     pub fn url(&self, path_and_query: &str) -> Url {
         let mut url = self.base.clone();
-        url.set_path("");
-        // path_and_query always starts with '/'; Url::join handles it.
-        url.join(path_and_query).unwrap_or_else(|_| {
-            let mut u = self.base.clone();
-            u.set_path(path_and_query);
-            u
-        })
+        // Set the components instead of using Url::join: join resolves a path
+        // like "//other.host/x" as a network-path reference and would send
+        // the request (and its access token) to other.host.
+        let (path, query) = match path_and_query.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path_and_query, None),
+        };
+        url.set_path(path);
+        url.set_query(query);
+        url
     }
 
     /// JSON request with Bearer auth; used for the proxy's own Matrix calls.
@@ -58,5 +61,52 @@ impl Upstream {
             serde_json::from_slice(&bytes).context("upstream returned non-JSON body")?
         };
         Ok((status, value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream(base: &str) -> Upstream {
+        Upstream::new(base.parse().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn url_joins_path_and_query_onto_base() {
+        let up = upstream("https://matrix.example.org");
+        assert_eq!(
+            up.url("/_matrix/client/v3/sync?since=s1&timeout=30000").as_str(),
+            "https://matrix.example.org/_matrix/client/v3/sync?since=s1&timeout=30000"
+        );
+        // A port and a trailing slash on the base change nothing.
+        let up = upstream("http://127.0.0.1:8008/");
+        assert_eq!(
+            up.url("/_matrix/client/versions").as_str(),
+            "http://127.0.0.1:8008/_matrix/client/versions"
+        );
+    }
+
+    #[test]
+    fn url_keeps_percent_encoding_intact() {
+        // Room and event IDs arrive percent-encoded and must reach the
+        // homeserver exactly as the client sent them.
+        let up = upstream("https://matrix.example.org");
+        let path = "/_matrix/client/r0/rooms/%21abc%3Aexample.org/event/%24a%2Fb";
+        assert_eq!(up.url(path).path(), path);
+    }
+
+    #[test]
+    fn url_cannot_be_redirected_to_another_host() {
+        // The request path is attacker-influenced (any local process can talk
+        // to the proxy); it must never change where the token is sent.
+        let up = upstream("https://matrix.example.org");
+        for path in ["//evil.example/_matrix", "/\\evil.example/x", "/@evil.example/x"] {
+            assert_eq!(
+                up.url(path).host_str(),
+                Some("matrix.example.org"),
+                "{path}"
+            );
+        }
     }
 }

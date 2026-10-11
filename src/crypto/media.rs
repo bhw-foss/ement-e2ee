@@ -144,6 +144,72 @@ mod tests {
     }
 
     #[test]
+    fn tampered_or_mismatched_attachments_are_rejected() {
+        let data = b"hello encrypted world".to_vec();
+        let (encrypted, info) = encrypt_attachment(&data).unwrap();
+        // MediaEncryptionInfo is not Clone; round-trip it like the cache does.
+        let info_json = serde_json::to_string(&info).unwrap();
+        let info = || serde_json::from_str::<MediaEncryptionInfo>(&info_json).unwrap();
+
+        // One flipped bit of ciphertext fails the SHA-256 check instead of
+        // yielding silently corrupted plaintext.
+        let mut tampered = encrypted.clone();
+        tampered[0] ^= 1;
+        assert!(decrypt_attachment(&tampered, info()).is_err());
+        // So does truncation ...
+        assert!(decrypt_attachment(&encrypted[..encrypted.len() - 1], info()).is_err());
+        // ... and decrypting with another file's key.
+        let (_, other_info) = encrypt_attachment(b"something else").unwrap();
+        assert!(decrypt_attachment(&encrypted, other_info).is_err());
+    }
+
+    #[test]
+    fn attachments_of_any_size_round_trip() {
+        for size in [0usize, 1, 15, 16, 17, 4096, 1 << 20] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let (encrypted, info) = encrypt_attachment(&data).unwrap();
+            // AES-CTR: no padding, so ciphertext length reveals exact size.
+            assert_eq!(encrypted.len(), size);
+            assert_eq!(decrypt_attachment(&encrypted, info).unwrap(), data, "size {size}");
+        }
+    }
+
+    #[test]
+    fn each_upload_gets_a_fresh_key() {
+        let (first, first_info) = encrypt_attachment(b"same bytes").unwrap();
+        let (second, second_info) = encrypt_attachment(b"same bytes").unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            serde_json::to_value(&first_info).unwrap()["key"]["k"],
+            serde_json::to_value(&second_info).unwrap()["key"]["k"]
+        );
+    }
+
+    #[test]
+    fn cache_persists_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("media.sqlite");
+        let (encrypted, info) = encrypt_attachment(b"data").unwrap();
+        {
+            let cache = MediaKeyCache::open(&path).unwrap();
+            cache.insert("mxc://example.org/abc", &info, None, None).unwrap();
+            // Seeing the same mxc again (say, with better metadata) replaces
+            // the row rather than failing on the primary key.
+            cache
+                .insert("mxc://example.org/abc", &info, Some("text/plain"), Some("a.txt"))
+                .unwrap();
+        }
+
+        // A proxy restart must not lose the keys: without them, media
+        // received earlier could never be decrypted again.
+        let cache = MediaKeyCache::open(&path).unwrap();
+        let entry = cache.get("mxc://example.org/abc").unwrap();
+        assert_eq!(entry.mimetype.as_deref(), Some("text/plain"));
+        assert_eq!(entry.filename.as_deref(), Some("a.txt"));
+        assert_eq!(decrypt_attachment(&encrypted, entry.info).unwrap(), b"data");
+    }
+
+    #[test]
     fn encrypted_room_content_rewrite_shape() {
         // MediaEncryptionInfo must serialize to the spec `file` object minus url.
         let (_, info) = encrypt_attachment(b"data").unwrap();

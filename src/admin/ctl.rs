@@ -320,3 +320,45 @@ impl Client {
         Ok(body)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn common(user_id: Option<&str>, with_user: Option<&str>) -> VerifyCommon {
+        VerifyCommon {
+            user_id: user_id.map(ToOwned::to_owned),
+            with_user: with_user.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn verify_targets_are_sent_only_when_given() {
+        let nothing = common(None, None);
+        assert_eq!(common_query(&nothing), "");
+        assert_eq!(common_body(&nothing), serde_json::json!({}));
+
+        let both = common(Some("@me:example.org"), Some("@you:example.org"));
+        assert_eq!(
+            common_query(&both),
+            "?user_id=@me:example.org&with_user=@you:example.org"
+        );
+        assert_eq!(
+            common_body(&both),
+            serde_json::json!({ "user_id": "@me:example.org", "with_user": "@you:example.org" })
+        );
+
+        let other_user_only = common(None, Some("@you:example.org"));
+        assert_eq!(common_query(&other_user_only), "?with_user=@you:example.org");
+        assert_eq!(
+            common_body(&other_user_only),
+            serde_json::json!({ "with_user": "@you:example.org" })
+        );
+    }
+
+    #[test]
+    fn client_base_url_tolerates_trailing_slash() {
+        assert_eq!(Client::new("http://127.0.0.1:8009").base, "http://127.0.0.1:8009/_ement");
+        assert_eq!(Client::new("http://127.0.0.1:8009/").base, "http://127.0.0.1:8009/_ement");
+    }
+}

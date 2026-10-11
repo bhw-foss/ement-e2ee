@@ -22,6 +22,8 @@ pub enum Route {
     RoomEvent {
         room_id: String,
     },
+    /// GET /notifications: events from any room, each tagged with its room_id.
+    Notifications,
     MediaUpload,
     MediaDownload {
         server: String,
@@ -68,6 +70,9 @@ pub fn classify(method: &Method, path: &str) -> Route {
         }
         ["_matrix", "client", _v, "rooms", room, "event", _event] if method == Method::GET => {
             Route::RoomEvent { room_id: dec(room) }
+        }
+        ["_matrix", "client", _v, "notifications"] if method == Method::GET => {
+            Route::Notifications
         }
         ["_matrix", "media", _v, "upload"] if method == Method::POST => Route::MediaUpload,
         ["_matrix", "client", _v, "media", "download", server, media_id, ..]
@@ -143,5 +148,116 @@ mod tests {
             classify(&Method::GET, "/_matrix/client/versions"),
             Route::Passthrough
         );
+    }
+
+    #[test]
+    fn classify_event_fetching_routes() {
+        let room = "!abc:example.org".to_owned();
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/_matrix/client/r0/rooms/!abc%3Aexample.org/messages"
+            ),
+            Route::Messages { room_id: room.clone() }
+        );
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/_matrix/client/v3/rooms/%21abc%3Aexample.org/context/%24event"
+            ),
+            Route::Context { room_id: room.clone() }
+        );
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/_matrix/client/v3/rooms/%21abc%3Aexample.org/event/%24event"
+            ),
+            Route::RoomEvent { room_id: room }
+        );
+        // ement asks for r0; the endpoint exists as v3 too.
+        for version in ["r0", "v3"] {
+            assert_eq!(
+                classify(
+                    &Method::GET,
+                    &format!("/_matrix/client/{version}/notifications")
+                ),
+                Route::Notifications
+            );
+        }
+    }
+
+    #[test]
+    fn classify_is_method_sensitive() {
+        // The same paths with other methods are different endpoints (or
+        // nothing at all) and must pass through untouched.
+        for (method, path) in [
+            (Method::POST, "/_matrix/client/v3/sync"),
+            (Method::POST, "/_matrix/client/r0/notifications"),
+            (Method::GET, "/_matrix/client/r0/rooms/!a%3Ab/send/m.room.message/1"),
+            (Method::POST, "/_matrix/client/r0/rooms/!a%3Ab/messages"),
+            (Method::GET, "/_matrix/media/r0/upload"),
+            (Method::POST, "/_matrix/client/v1/media/download/example.org/abcd"),
+        ] {
+            assert_eq!(classify(&method, path), Route::Passthrough, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn classify_media_and_admin_routes() {
+        for version in ["r0", "v3"] {
+            assert_eq!(
+                classify(&Method::POST, &format!("/_matrix/media/{version}/upload")),
+                Route::MediaUpload
+            );
+        }
+        // A trailing file name on a download does not change the media ID.
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/_matrix/media/v3/download/example.org/abcd/cat%20pic.png"
+            ),
+            Route::MediaDownload {
+                server: "example.org".into(),
+                media_id: "abcd".into(),
+                authenticated: false,
+            }
+        );
+        // Thumbnails and incomplete download paths are not intercepted.
+        for path in [
+            "/_matrix/media/r0/thumbnail/example.org/abcd",
+            "/_matrix/client/v1/media/thumbnail/example.org/abcd",
+            "/_matrix/client/v1/media/download/example.org",
+        ] {
+            assert_eq!(classify(&Method::GET, path), Route::Passthrough, "{path}");
+        }
+
+        assert_eq!(
+            classify(&Method::GET, "/_ement/status"),
+            Route::Admin("status".into())
+        );
+        assert_eq!(
+            classify(&Method::POST, "/_ement/verify/abc/confirm"),
+            Route::Admin("verify/abc/confirm".into())
+        );
+        assert_eq!(classify(&Method::GET, "/_ement"), Route::Admin(String::new()));
+        // Only the exact prefix is the admin API.
+        assert_eq!(classify(&Method::GET, "/_ementx/status"), Route::Passthrough);
+    }
+
+    #[test]
+    fn classify_unrelated_paths() {
+        for path in [
+            "/",
+            "",
+            "/_matrix/client/r0/rooms/!a%3Ab/state/m.room.topic",
+            "/_matrix/client/r0/rooms/!a%3Ab/send/m.room.message",
+            "/_matrix/client/r0/sync/extra",
+            "/_matrix/federation/v1/version",
+            "/.well-known/matrix/client",
+        ] {
+            for method in [Method::GET, Method::PUT, Method::POST] {
+                assert_eq!(classify(&method, path), Route::Passthrough, "{method} {path}");
+            }
+        }
     }
 }

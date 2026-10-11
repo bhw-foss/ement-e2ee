@@ -72,6 +72,29 @@ pub async fn process_event_body(ctx: &Arc<AccountContext>, room_id: &RoomId, bod
     decrypt_event(ctx, room_id, body).await;
 }
 
+/// Rewrite a GET /notifications response body. Unlike the per-room history
+/// endpoints, notifications span rooms: each entry names its own room_id next
+/// to the event. (Encrypted DMs notify on the m.room.encrypted envelope via
+/// the `.m.rule.encrypted_room_one_to_one` push rule, so without this ement's
+/// notifications buffer only ever sees ciphertext for them.)
+pub async fn process_notifications_body(ctx: &Arc<AccountContext>, body: &mut Value) {
+    let Some(notifications) = body.get_mut("notifications").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for notification in notifications {
+        let Some(room_id) = notification
+            .get("room_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<OwnedRoomId>().ok())
+        else {
+            continue;
+        };
+        if let Some(event) = notification.get_mut("event") {
+            decrypt_event(ctx, &room_id, event).await;
+        }
+    }
+}
+
 pub async fn decrypt_events(ctx: &Arc<AccountContext>, room_id: &RoomId, events: &mut [Value]) {
     for event in events {
         decrypt_event(ctx, room_id, event).await;
@@ -227,6 +250,35 @@ mod tests {
                 .contains("MissingRoomKey")
         );
     }
+
+    #[test]
+    fn utd_placeholder_copes_with_sparse_events() {
+        // No unsigned, no session ID (e.g. a malformed event).
+        let original = json!({ "type": "m.room.encrypted", "event_id": "$abc" });
+        let placeholder = utd_placeholder(&original, "MalformedEncryptedEvent", None);
+        assert_eq!(placeholder["event_id"], "$abc");
+        assert_eq!(placeholder["content"]["msgtype"], "m.text");
+        assert_eq!(placeholder["unsigned"]["ement_e2ee"]["utd"], true);
+        assert!(placeholder["unsigned"]["ement_e2ee"]["session_id"].is_null());
+        // Absent envelope fields are not invented.
+        assert!(placeholder.get("sender").is_none());
+        assert!(placeholder.get("origin_server_ts").is_none());
+        // The ciphertext is dropped, not carried along.
+        assert!(!placeholder.to_string().contains("ciphertext"));
+    }
+
+    #[test]
+    fn utd_placeholder_keeps_room_id_for_history_endpoints() {
+        let original = json!({
+            "type": "m.room.encrypted",
+            "event_id": "$abc",
+            "room_id": "!room:example.org",
+            "content": { "ciphertext": "..." },
+        });
+        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"));
+        assert_eq!(placeholder["room_id"], "!room:example.org");
+        assert_eq!(placeholder["unsigned"]["ement_e2ee"]["session_id"], "sess");
+    }
 }
 
 /// Ask other own-devices / original sender for the missing room key, once per
@@ -251,6 +303,9 @@ async fn maybe_request_room_key(
     let session_id = session_id.to_owned();
     tokio::spawn(async move {
         let result = async {
+            // The request sits in the machine's outgoing queue until marked
+            // as sent; without the pump lock a concurrent pump sends it too.
+            let _guard = ctx.pump_lock.lock().await;
             let (cancellation, request) = ctx.olm.request_room_key(&raw, &room_id).await?;
             if let Some(cancellation) = cancellation {
                 machine::send_and_mark(&ctx, &cancellation).await?;

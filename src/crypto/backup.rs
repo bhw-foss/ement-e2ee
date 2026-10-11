@@ -6,7 +6,6 @@ use anyhow::Context as _;
 use matrix_sdk_crypto::olm::ExportedRoomKey;
 use matrix_sdk_crypto::store::types::BackupDecryptionKey;
 use matrix_sdk_crypto::types::RoomKeyBackupInfo;
-use ruma::api::IncomingResponse as _;
 use ruma::api::client::backup::get_backup_keys;
 
 use crate::session::AccountContext;
@@ -110,11 +109,9 @@ pub async fn restore_from_backup(
     if !status.is_success() {
         anyhow::bail!("downloading room keys failed: {status} {body}");
     }
-    let http_response = http::Response::builder()
-        .status(200)
-        .body(serde_json::to_vec(&body)?)?;
-    let downloaded = get_backup_keys::v3::Response::try_from_http_response(http_response)
-        .context("malformed room_keys/keys response")?;
+    let downloaded: get_backup_keys::v3::Response =
+        crate::crypto::machine::parse_response(&body)
+            .context("malformed room_keys/keys response")?;
 
     // Decrypt each session and import, mirroring handle_downloaded_room_keys.
     let mut total = 0usize;

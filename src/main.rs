@@ -6,6 +6,11 @@ mod proxy;
 mod session;
 mod upstream;
 
+#[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
+mod testutil;
+
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -95,4 +100,81 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once(&"ement-e2ee").chain(args)).unwrap()
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn serve_is_the_default_command() {
+        let cli = parse(&["--homeserver", "https://matrix.org", "--log-level", "debug"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.serve.homeserver.as_deref(), Some("https://matrix.org"));
+        assert_eq!(cli.serve.log_level.as_deref(), Some("debug"));
+
+        let cli = parse(&["serve", "--listen", "127.0.0.1:9000", "--store-dir", "/tmp/s"]);
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.listen, Some("127.0.0.1:9000".parse().unwrap()));
+        assert_eq!(args.store_dir, Some("/tmp/s".into()));
+    }
+
+    #[test]
+    fn readme_ctl_invocations_parse() {
+        for args in [
+            &["ctl", "status"][..],
+            &["ctl", "bootstrap"],
+            &["ctl", "bootstrap", "--recovery-key-file", "key.txt"],
+            &["ctl", "bootstrap", "--user-id", "@me:example.org"],
+            &["ctl", "verify", "list"],
+            &["ctl", "verify", "start", "ELEMENTDEVICEID"],
+            &["ctl", "verify", "show", "flow1"],
+            &["ctl", "verify", "accept", "flow1"],
+            &["ctl", "verify", "start-sas", "flow1"],
+            &["ctl", "verify", "sas-accept", "flow1"],
+            &["ctl", "verify", "confirm", "flow1", "--with-user", "@you:example.org"],
+            &["ctl", "verify", "cancel", "flow1"],
+            &["ctl", "keys", "export", "keys.txt"],
+            &["ctl", "keys", "import", "keys.txt", "--user-id", "@me:example.org"],
+            &["ctl", "--proxy", "http://127.0.0.1:9000", "status"],
+        ] {
+            let cli = parse(args);
+            assert!(matches!(cli.command, Some(Command::Ctl(_))), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn ctl_talks_to_the_default_listen_address() {
+        let Some(Command::Ctl(args)) = parse(&["ctl", "status"]).command else {
+            panic!("expected ctl");
+        };
+        assert_eq!(args.proxy, "http://127.0.0.1:8009");
+    }
+
+    #[test]
+    fn bad_invocations_are_rejected() {
+        for args in [
+            &["ctl"][..],
+            &["ctl", "verify"],
+            &["ctl", "verify", "start"],
+            &["ctl", "keys", "export"],
+            &["serve", "--listen", "not-an-address"],
+            &["frobnicate"],
+        ] {
+            let result = Cli::try_parse_from(std::iter::once(&"ement-e2ee").chain(args));
+            assert!(result.is_err(), "{args:?}");
+        }
+    }
 }

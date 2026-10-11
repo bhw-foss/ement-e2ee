@@ -64,3 +64,47 @@ pub async fn passthrough(state: &AppState, req: Request) -> Result<Response, Pro
         .map_err(|e| ProxyError::Internal(e.into()))?;
     Ok(resp)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn hop_by_hop_and_host_headers_are_not_forwarded() {
+        let mut src = HeaderMap::new();
+        for (name, value) in [
+            ("host", "localhost:8009"),
+            ("connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("te", "trailers"),
+            ("authorization", "Bearer token"),
+            ("content-type", "application/json"),
+            ("x-custom", "kept"),
+        ] {
+            src.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+        let mut dst = HeaderMap::new();
+        copy_headers(&src, &mut dst);
+
+        let mut forwarded: Vec<&str> = dst.keys().map(HeaderName::as_str).collect();
+        forwarded.sort();
+        assert_eq!(forwarded, ["authorization", "content-type", "x-custom"]);
+    }
+
+    #[test]
+    fn repeated_headers_are_all_forwarded() {
+        let mut src = HeaderMap::new();
+        src.append("set-cookie", HeaderValue::from_static("a=1"));
+        src.append("set-cookie", HeaderValue::from_static("b=2"));
+        let mut dst = HeaderMap::new();
+        copy_headers(&src, &mut dst);
+        assert_eq!(dst.get_all("set-cookie").iter().count(), 2);
+    }
+}

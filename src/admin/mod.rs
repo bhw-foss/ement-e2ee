@@ -215,10 +215,16 @@ async fn status(state: &AppState) -> Result<Response, ProxyError> {
         let cross_signing = ctx.olm.cross_signing_status().await;
         let backup_machine = ctx.olm.backup_machine();
         let backup_keys = backup_machine.get_backup_keys().await.ok();
+        // Base64, as other clients display them (Element's "Session key" is
+        // the ed25519 one); the derived Serialize emits raw byte arrays.
+        let identity_keys = ctx.olm.identity_keys();
         sessions.push(serde_json::json!({
             "user_id": ctx.user_id.as_str(),
             "device_id": ctx.device_id.as_str(),
-            "identity_keys": ctx.olm.identity_keys(),
+            "identity_keys": {
+                "ed25519": identity_keys.ed25519.to_base64(),
+                "curve25519": identity_keys.curve25519.to_base64(),
+            },
             "cross_signing": {
                 "has_master": cross_signing.has_master,
                 "has_self_signing": cross_signing.has_self_signing,
@@ -318,5 +324,43 @@ async fn bootstrap(state: &AppState, body: serde_json::Value) -> Result<Response
                 format!("{e:#}"),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_query_takes_values_verbatim() {
+        let query = parse_query(Some("user_id=@a=b:example.org&with_user=@c:example.org"));
+        // Matrix IDs may contain '='; only the first one separates the key.
+        assert_eq!(query["user_id"], "@a=b:example.org");
+        assert_eq!(query["with_user"], "@c:example.org");
+        assert_eq!(query.len(), 2);
+    }
+
+    #[test]
+    fn parse_query_ignores_junk() {
+        assert!(parse_query(None).is_empty());
+        assert!(parse_query(Some("")).is_empty());
+        let query = parse_query(Some("flag&user_id=@a:b&&"));
+        assert_eq!(query.len(), 1);
+        assert_eq!(query["user_id"], "@a:b");
+    }
+
+    #[test]
+    fn json_params_keeps_only_strings() {
+        let params = json_params(&serde_json::json!({
+            "device_id": "ABCDEF",
+            "count": 3,
+            "nested": { "a": "b" },
+            "nothing": null,
+        }));
+        assert_eq!(params.len(), 1);
+        assert_eq!(params["device_id"], "ABCDEF");
+        // A missing or non-object body means no parameters, not an error.
+        assert!(json_params(&serde_json::Value::Null).is_empty());
+        assert!(json_params(&serde_json::json!(["device_id"])).is_empty());
     }
 }

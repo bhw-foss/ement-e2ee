@@ -183,3 +183,26 @@ pub fn sanitize_for_path(id: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_matrix_ids_readable() {
+        assert_eq!(sanitize_for_path("@alice:example.org"), "@alice:example.org");
+        assert_eq!(sanitize_for_path("ABCDEFGHIJ"), "ABCDEFGHIJ");
+        assert_eq!(sanitize_for_path("a.b-c_d=e+f"), "a.b-c_d=e+f");
+    }
+
+    #[test]
+    fn sanitize_neutralizes_path_syntax() {
+        // IDs come from the homeserver; they must not be able to climb out of
+        // the store directory.
+        assert_eq!(sanitize_for_path("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_for_path("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_for_path("dev ice\0\n"), "dev_ice__");
+        assert_eq!(sanitize_for_path("gerät"), "ger_t");
+        assert!(!sanitize_for_path("@a/../../b:hs").contains('/'));
+    }
+}

@@ -161,7 +161,6 @@ pub(crate) async fn send_room_message_request(
     ctx: &Arc<AccountContext>,
     request: &matrix_sdk_crypto::types::requests::RoomMessageRequest,
 ) -> anyhow::Result<()> {
-    use ruma::api::IncomingResponse as _;
     use ruma::events::MessageLikeEventContent as _;
 
     let event_type = request.content.event_type().to_string();
@@ -189,13 +188,8 @@ pub(crate) async fn send_room_message_request(
     if !status.is_success() {
         anyhow::bail!("in-room verification send failed: {status} {response_body}");
     }
-    let http_response = http::Response::builder()
-        .status(200)
-        .body(serde_json::to_vec(&response_body)?)?;
-    let response =
-        ruma::api::client::message::send_message_event::v3::Response::try_from_http_response(
-            http_response,
-        )?;
+    let response: ruma::api::client::message::send_message_event::v3::Response =
+        machine::parse_response(&response_body)?;
     ctx.olm
         .mark_request_as_sent(&request.txn_id, &response)
         .await?;
