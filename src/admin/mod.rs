@@ -308,7 +308,11 @@ pub async fn resolve_session(
         None => match sessions.len() {
             0 => Err(json_error(
                 StatusCode::CONFLICT,
-                "no active sessions — connect ement through the proxy first",
+                match state.sessions.refused().first() {
+                    // ement did connect; say why that was not enough.
+                    Some(conflict) => format!("no active sessions: {conflict}"),
+                    None => "no active sessions — connect ement through the proxy first".to_owned(),
+                },
             )),
             1 => Ok(sessions.into_iter().next().unwrap()),
             _ => Err(json_error(

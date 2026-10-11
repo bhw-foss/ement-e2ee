@@ -544,6 +544,346 @@ async fn store_survives_proxy_restart() {
     assert_eq!(identity_before.curve25519, identity_after.curve25519);
 }
 
+// ---- one device ID, one set of identity keys ----
+
+/// The device ID ement asks for on every login: a hash of
+/// "Ement.el: <login>@<host>", the same whatever became of the store.
+const EMENT_DEVICE_ID: &str = "03f8f9640d1c7a5b9e2f4c6a8b0d2e4f6a8c0e2b4d6f8a1c3e5b7d9f1a3c5e7b";
+
+fn ement_login_request(user: &str) -> Value {
+    json!({
+        "type": "m.login.password",
+        "identifier": { "type": "m.id.user", "user": user },
+        "password": "hunter2",
+        "device_id": EMENT_DEVICE_ID,
+        "initial_device_display_name": "Ement.el: ben@host",
+    })
+}
+
+/// Log in the way ement does. `assigned` is the device ID the homeserver
+/// gives a login that does not ask for one. Returns the access token and
+/// the device ID of the session.
+async fn ement_login(h: &Harness, user: &str, assigned: &str) -> (String, String) {
+    let token = format!("token-{assigned}");
+    h.hs.add_login(user, assigned, &token);
+    let body = ement_login_request(user);
+    let (status, response) = h.post(None, "/_matrix/client/r0/login", &body).await;
+    assert_eq!(status, 200, "login: {response}");
+    assert_eq!(response["access_token"], token.as_str());
+    let device = response["device_id"].as_str().unwrap().to_owned();
+    wait_until("device keys are published", || {
+        h.hs.identity_key(user, &device).is_some()
+    })
+    .await;
+    (token, device)
+}
+
+/// Sign a device out from another client, and let the proxy find out.
+async fn sign_out_elsewhere(h: &Harness, user: &str, device: &str, token: &str) {
+    let session = std::sync::Arc::downgrade(&h.state.sessions.get(token).await.unwrap());
+    h.hs.delete_device(user, device);
+    let (status, _) = h.get(token, "/_matrix/client/r0/sync").await;
+    assert_eq!(status, 401);
+    wait_until("the session is dropped", || session.upgrade().is_none()).await;
+}
+
+fn store_of(h: &Harness, user: &str, device: &str) -> std::path::PathBuf {
+    let user = <&UserId>::try_from(user).unwrap();
+    crate::crypto::machine::account_store_dir(&h.state.config, user, device.into())
+}
+
+fn event_with_id<'a>(events: &'a [Value], event_id: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|event| event["event_id"] == event_id)
+        .unwrap_or_else(|| panic!("no event {event_id} in {events:?}"))
+}
+
+/// From a bug report: the ement session was signed out from another client,
+/// then ement logged in again. The homeserver had deleted the device's keys,
+/// while the store still held them and took them for published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn device_signed_out_elsewhere_is_published_again_on_login() {
+    let h = Harness::start().await;
+    let room = h.hs.create_room(&[ALICE, BOB], true);
+    let (alice, device) = ement_login(&h, ALICE, "ASSIGNED1").await;
+    let bob = h.connect(BOB, "BOBDEVICE").await;
+    h.send_text(&bob, &room, "before").await;
+    assert_decrypted_text(&h.sync_timeline(&alice, &room).await[0], "before");
+    let identity = h.hs.identity_key(ALICE, &device);
+
+    sign_out_elsewhere(&h, ALICE, &device, &alice).await;
+    assert_eq!(h.hs.identity_key(ALICE, &device), None);
+    // Bob sees the device go.
+    h.sync(&bob).await;
+    h.send_text(&bob, &room, "while away").await;
+
+    // ement logs in again and gets the same device back, keys and all.
+    let (alice, same_device) = ement_login(&h, ALICE, "ASSIGNED2").await;
+    assert_eq!(same_device, device);
+    assert_eq!(h.hs.identity_key(ALICE, &device), identity);
+
+    // It is whole again: the one-time keys the homeserver deleted are
+    // replaced on the next sync, and messages reach it.
+    h.sync(&alice).await;
+    wait_until("one-time keys are replenished", || {
+        h.hs.one_time_key_count(ALICE, &device) > 0
+    })
+    .await;
+    h.sync(&bob).await;
+    let event_id = h.send_text(&bob, &room, "after").await;
+    let events = h.sync_timeline(&alice, &room).await;
+    assert_decrypted_text(event_with_id(&events, &event_id), "after");
+}
+
+/// The other half of that report: the store deleted for a clean start.
+/// Putting new keys under the old device ID does not work, as clients that
+/// know the old keys never accept others for it (and Synapse keeps the old
+/// cross-signing signature for good). The login has to be a new device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn login_without_a_store_is_a_new_device() {
+    let h = Harness::start().await;
+    let room = h.hs.create_room(&[ALICE, BOB], true);
+    let (alice, old_device) = ement_login(&h, ALICE, "ASSIGNED1").await;
+    let bob = h.connect(BOB, "BOBDEVICE").await;
+    h.send_text(&bob, &room, "before").await;
+    assert_decrypted_text(&h.sync_timeline(&alice, &room).await[0], "before");
+
+    sign_out_elsewhere(&h, ALICE, &old_device, &alice).await;
+    std::fs::remove_dir_all(store_of(&h, ALICE, &old_device)).unwrap();
+    let (alice, new_device) = ement_login(&h, ALICE, "ASSIGNED2").await;
+
+    // Bob was not looking while the old device went. His messages reach
+    // the new one all the same ...
+    h.sync(&bob).await;
+    let event_id = h.send_text(&bob, &room, "after").await;
+    let events = h.sync_timeline(&alice, &room).await;
+    assert_decrypted_text(event_with_id(&events, &event_id), "after");
+    // ... because it is a device he has not met, not the old one re-keyed.
+    assert_ne!(new_device, old_device);
+    assert_eq!(h.hs.identity_key(ALICE, &old_device), None);
+}
+
+/// Unless it saves sessions, ement logs in on every start, always asking
+/// for the same device ID. While the store is there that is one device, not
+/// another one per login.
+#[tokio::test]
+async fn login_reuses_the_device_whose_store_exists() {
+    let h = Harness::start().await;
+    let (_, device) = ement_login(&h, ALICE, "ASSIGNED1").await;
+    let identity = h.hs.identity_key(ALICE, &device);
+    let (_, again) = ement_login(&h, ALICE, "ASSIGNED2").await;
+    assert_eq!(again, device);
+    assert_eq!(h.hs.identity_key(ALICE, &device), identity);
+    assert_eq!(h.hs.identity_key(ALICE, "ASSIGNED2"), None);
+
+    // The device ID is the proxy's choice: the homeserver's pick at first,
+    // then that one again. The rest of the request is ement's.
+    let logins: Vec<Value> =
+        h.hs.requests_to("/login")
+            .iter()
+            .map(|request| request.json())
+            .collect();
+    assert_eq!(device, "ASSIGNED1");
+    assert_eq!(logins[0].get("device_id"), None);
+    assert_eq!(logins[1]["device_id"], "ASSIGNED1");
+    for login in &logins {
+        assert_eq!(login["password"], "hunter2");
+        assert_eq!(login["identifier"]["user"], ALICE);
+        assert_eq!(login["initial_device_display_name"], "Ement.el: ben@host");
+    }
+
+    // Another account used from the same Emacs asks for the same ID, and
+    // gets a device of its own.
+    let (_, bobs) = ement_login(&h, BOB, "ASSIGNED3").await;
+    assert_eq!(bobs, "ASSIGNED3");
+}
+
+/// The homeserver was in trouble when the login's session should have
+/// started. It starts with the first sync instead, and the next login still
+/// finds its device.
+#[tokio::test]
+async fn login_is_remembered_when_its_session_starts_late() {
+    let h = Harness::start().await;
+    h.hs.lock().fail_keys_query = true;
+    h.hs.add_login(ALICE, "ASSIGNED1", "token-ASSIGNED1");
+    let login = ement_login_request(ALICE);
+    let (status, response) = h.post(None, "/_matrix/client/r0/login", &login).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["device_id"], "ASSIGNED1");
+    assert!(h.state.sessions.list().await.is_empty());
+
+    h.hs.lock().fail_keys_query = false;
+    h.sync("token-ASSIGNED1").await;
+    wait_until("device keys are uploaded", || {
+        h.hs.has_device_keys(ALICE, "ASSIGNED1")
+    })
+    .await;
+    let (_, device) = ement_login(&h, ALICE, "ASSIGNED2").await;
+    assert_eq!(device, "ASSIGNED1");
+}
+
+/// Stores made before the proxy chose device IDs sit under ement's own ID.
+/// They stay in use.
+#[tokio::test]
+async fn login_keeps_a_store_under_the_clients_own_device_id() {
+    let hs = FakeHomeserver::start().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let start = || {
+        Harness::builder()
+            .homeserver(&hs)
+            .store_dir(store_dir.path())
+            .start()
+    };
+    let first = start().await;
+    first.connect(ALICE, EMENT_DEVICE_ID).await;
+    let identity = hs.identity_key(ALICE, EMENT_DEVICE_ID);
+    first.shutdown().await;
+
+    let h = start().await;
+    let (_, device) = ement_login(&h, ALICE, "ASSIGNED1").await;
+    assert_eq!(device, EMENT_DEVICE_ID);
+    assert_eq!(hs.identity_key(ALICE, EMENT_DEVICE_ID), identity);
+}
+
+/// ement restores a saved session whose store has been deleted. The device
+/// still has its keys on the homeserver; they must not be replaced, and the
+/// session must not be passed through without encryption either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_whose_store_is_gone_is_refused_not_rekeyed() {
+    let hs = FakeHomeserver::start().await;
+    let room = hs.create_room(&[ALICE, BOB], true);
+    let store_dir = tempfile::tempdir().unwrap();
+    let start = || {
+        Harness::builder()
+            .homeserver(&hs)
+            .store_dir(store_dir.path())
+            .start()
+    };
+    let first = start().await;
+    let alice = first.connect(ALICE, "ALICEDEVICE").await;
+    let identity = hs.identity_key(ALICE, "ALICEDEVICE");
+    let store = store_of(&first, ALICE, "ALICEDEVICE");
+    first.shutdown().await;
+    std::fs::remove_dir_all(&store).unwrap();
+
+    let h = start().await;
+    let (status, body) = h.get(&alice, "/_matrix/client/r0/sync").await;
+    assert_eq!(status, 409, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("ALICEDEVICE"), "{error}");
+    assert!(error.contains("log in again"), "{error}");
+    // The device keeps its keys, and no store is begun for it.
+    assert_eq!(hs.identity_key(ALICE, "ALICEDEVICE"), identity);
+    assert!(!store.exists());
+    assert!(h.state.sessions.list().await.is_empty());
+
+    // Nothing leaves in the clear.
+    let send = format!(
+        "/_matrix/client/r0/rooms/{}/send/m.room.message/txn1",
+        enc(&room)
+    );
+    let message = json!({ "msgtype": "m.text", "body": "secret" });
+    let (status, _) = h.put(&alice, &send, &message).await;
+    assert_eq!(status, 409);
+    assert!(hs.requests_to("/send/").is_empty());
+
+    // `ctl debug check` names the problem, not "connect ement".
+    let (_, report) = debug_get(&h, "check").await;
+    let refused = check_named(&report["proxy"], "refused_session");
+    assert_eq!(refused["status"], "fail");
+    assert!(refused["detail"].as_str().unwrap().contains("ALICEDEVICE"));
+    assert!(refused["hint"].as_str().unwrap().contains("log in again"));
+    assert!(
+        report["proxy"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["id"] != "sessions"),
+        "{report}"
+    );
+    // So do the commands that need a session.
+    let recovery_key = json!({ "recovery_key": "x" });
+    let (status, body) = h.post(None, "/_ement/bootstrap", &recovery_key).await;
+    assert_eq!(status, 409);
+    assert!(body["error"].as_str().unwrap().contains("log in again"));
+
+    // Logging in again is the way out, as a new device.
+    let (alice, device) = ement_login(&h, ALICE, "ASSIGNED1").await;
+    assert_eq!(device, "ASSIGNED1");
+    h.sync(&alice).await;
+    assert_eq!(hs.identity_key(ALICE, "ALICEDEVICE"), identity);
+    let (_, report) = debug_get(&h, "check").await;
+    assert_eq!(report["summary"]["fail"], 0, "{report}");
+}
+
+/// The store is there, but the homeserver publishes other keys for the
+/// device: another program has set the device up anew under the same ID.
+#[tokio::test]
+async fn session_whose_store_holds_other_keys_is_refused() {
+    let hs = FakeHomeserver::start().await;
+    let (ours, theirs) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let start = |dir: &std::path::Path| Harness::builder().homeserver(&hs).store_dir(dir).start();
+
+    let first = start(ours.path()).await;
+    first.connect(ALICE, "ALICEDEVICE").await;
+    let store = store_of(&first, ALICE, "ALICEDEVICE");
+    first.shutdown().await;
+
+    hs.delete_device(ALICE, "ALICEDEVICE");
+    let other = start(theirs.path()).await;
+    let alice = other.connect(ALICE, "ALICEDEVICE").await;
+    let identity = hs.identity_key(ALICE, "ALICEDEVICE");
+    other.shutdown().await;
+
+    let h = start(ours.path()).await;
+    let (status, body) = h.get(&alice, "/_matrix/client/r0/sync").await;
+    assert_eq!(status, 409, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains(store.to_str().unwrap()), "{error}");
+    assert!(error.contains("log in again"), "{error}");
+    // Neither side is touched: the homeserver's keys stay, and so does the
+    // store, with whatever room keys it holds.
+    assert_eq!(hs.identity_key(ALICE, "ALICEDEVICE"), identity);
+    assert!(store.join("matrix-sdk-crypto.sqlite3").is_file());
+}
+
+/// A new device's keys are published only once the homeserver has said the
+/// device has none. Without an answer nothing is published, and the client
+/// is told to try again.
+#[tokio::test]
+async fn new_device_waits_for_the_homeserver_to_say_it_has_no_keys() {
+    let hs = FakeHomeserver::start().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let start = || {
+        Harness::builder()
+            .homeserver(&hs)
+            .store_dir(store_dir.path())
+            .start()
+    };
+    let h = start().await;
+    hs.add_device(ALICE, "ALICEDEVICE", "alice-token");
+    hs.lock().fail_keys_query = true;
+    let (status, _) = h.get("alice-token", "/_matrix/client/r0/sync").await;
+    // 502: ement syncs again by itself.
+    assert_eq!(status, 502);
+    assert!(hs.requests_to("/keys/upload").is_empty());
+    assert!(!store_of(&h, ALICE, "ALICEDEVICE").exists());
+
+    hs.lock().fail_keys_query = false;
+    h.sync("alice-token").await;
+    wait_until("device keys are uploaded", || {
+        hs.has_device_keys(ALICE, "ALICEDEVICE")
+    })
+    .await;
+    h.shutdown().await;
+
+    // A device with a store does not depend on that answer.
+    hs.lock().fail_keys_query = true;
+    let h = start().await;
+    h.sync("alice-token").await;
+}
+
 #[tokio::test]
 async fn passthrough_relays_everything_else() {
     let h = Harness::start().await;
@@ -821,6 +1161,38 @@ impl DirectClient {
         assert!(resp.status().is_success(), "{path}: {}", resp.status());
         resp.json().await.unwrap()
     }
+
+    /// Give the account a cross-signing identity, with this device signed.
+    async fn set_up_cross_signing(&self) {
+        let requests = self.olm.bootstrap_cross_signing(false).await.unwrap();
+        let upload = requests.upload_keys_req.expect("device keys to upload");
+        let AnyOutgoingRequest::KeysUpload(keys) = upload.request() else {
+            panic!("expected a keys upload");
+        };
+        self.call(
+            Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            &json!({ "device_keys": keys.device_keys }),
+        )
+        .await;
+        let signing_keys = &requests.upload_signing_keys_req;
+        self.call(
+            Method::POST,
+            "/_matrix/client/v3/keys/device_signing/upload",
+            &json!({
+                "master_key": signing_keys.master_key,
+                "self_signing_key": signing_keys.self_signing_key,
+                "user_signing_key": signing_keys.user_signing_key,
+            }),
+        )
+        .await;
+        self.call(
+            Method::POST,
+            "/_matrix/client/v3/keys/signatures/upload",
+            &serde_json::to_value(&requests.upload_signatures_req.signed_keys).unwrap(),
+        )
+        .await;
+    }
 }
 
 /// The `ctl bootstrap` journey: an account with cross-signing, secret storage
@@ -834,37 +1206,7 @@ async fn bootstrap_joins_existing_identity_and_restores_backup() {
 
     // Bob's existing client sets up cross-signing ...
     let element = DirectClient::new(&h.hs, BOB, "ELEMENT").await;
-    let requests = element.olm.bootstrap_cross_signing(false).await.unwrap();
-    let upload = requests.upload_keys_req.expect("device keys to upload");
-    let AnyOutgoingRequest::KeysUpload(keys) = upload.request() else {
-        panic!("expected a keys upload");
-    };
-    element
-        .call(
-            Method::POST,
-            "/_matrix/client/v3/keys/upload",
-            &json!({ "device_keys": keys.device_keys }),
-        )
-        .await;
-    let signing_keys = &requests.upload_signing_keys_req;
-    element
-        .call(
-            Method::POST,
-            "/_matrix/client/v3/keys/device_signing/upload",
-            &json!({
-                "master_key": signing_keys.master_key,
-                "self_signing_key": signing_keys.self_signing_key,
-                "user_signing_key": signing_keys.user_signing_key,
-            }),
-        )
-        .await;
-    element
-        .call(
-            Method::POST,
-            "/_matrix/client/v3/keys/signatures/upload",
-            &serde_json::to_value(&requests.upload_signatures_req.signed_keys).unwrap(),
-        )
-        .await;
+    element.set_up_cross_signing().await;
 
     // ... a key backup ...
     let backup_key = BackupDecryptionKey::new();
@@ -1714,6 +2056,10 @@ async fn debug_check_flags_what_is_broken() {
     h.hs.add_login("@carol:hs.test", "CAROLDEVICE", "carol-token");
     let login = json!({ "type": "m.login.password", "identifier": { "user": "@carol:hs.test" } });
     h.post(None, "/_matrix/client/r0/login", &login).await;
+    wait_until("the new device's keys are uploaded", || {
+        h.hs.has_device_keys("@carol:hs.test", "CAROLDEVICE")
+    })
+    .await;
 
     let (_, report) = debug_get(&h, "check").await;
     let placeholders = check_named(&checks_for(&report, BOB), "placeholders").clone();
@@ -1756,6 +2102,55 @@ async fn debug_check_flags_what_is_broken() {
     assert_eq!(token["status"], "fail");
     assert!(token["hint"].as_str().unwrap().contains("log in again"));
     assert_eq!(report["summary"]["fail"], 1);
+}
+
+/// Synapse keeps the cross-signing signatures of a device that is signed
+/// out, hands them out with whatever keys the device ID gets next, and
+/// skips every signature uploaded after that. Such a device can be verified
+/// as often as one likes, to no effect; the check has to say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_check_reports_a_cross_signature_over_other_keys() {
+    let h = Harness::start().await;
+    let element = DirectClient::new(&h.hs, BOB, "ELEMENT").await;
+    element.set_up_cross_signing().await;
+    let ement = h.connect(BOB, "EMENT").await;
+
+    // A signature by the account's self-signing key, made over other keys.
+    let self_signing_key_id = h.hs.lock().cross_signing[BOB]["self_signing_key"]["keys"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let of_something_else =
+        h.hs.lock().device_keys(BOB, "EMENT")["signatures"][BOB]["ed25519:EMENT"].clone();
+    let signed = json!({ "signatures": { BOB: { self_signing_key_id: of_something_else } } });
+    element
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/keys/signatures/upload",
+            &json!({ BOB: { "EMENT": signed } }),
+        )
+        .await;
+
+    h.sync(&ement).await;
+    let mut check = Value::Null;
+    wait_for("the check sees the signature", async || {
+        let (_, report) = debug_get(&h, "check").await;
+        check = check_named(&report["sessions"][0]["checks"], "device_verified").clone();
+        check["status"] == "fail"
+    })
+    .await;
+    assert!(check["detail"].as_str().unwrap().contains("signature"));
+    let hint = check["hint"].as_str().unwrap();
+    assert!(hint.contains("log in again"), "{hint}");
+    assert!(
+        hint.contains(store_of(&h, BOB, "EMENT").to_str().unwrap()),
+        "{hint}"
+    );
+    // Verifying once more is exactly what does not help.
+    assert!(!hint.contains("ctl bootstrap"), "{hint}");
 }
 
 #[tokio::test]

@@ -194,7 +194,8 @@ Matrix IDs and public keys, but no tokens, passphrases or private keys.
 - **Session restore**: if you use `ement-save-sessions`, the proxy re-learns
   the session from the token via `/account/whoami` — nothing to do. If you
   log out (token invalidated), the session is evicted; log in through the
-  proxy again.
+  proxy again. A saved session whose store is gone is refused: see
+  [Devices](#devices).
 - **Tokenless media** (room avatars): ement fetches these without auth; the
   proxy borrows an active session's token upstream. With zero sessions they
   pass through untouched.
@@ -205,6 +206,32 @@ Matrix IDs and public keys, but no tokens, passphrases or private keys.
   only on 127.0.0.1 (default), and note that localhost is shared with Windows
   processes.
 
+## Devices
+
+A device keeps its identity keys for life. Other clients never accept new
+keys for a device ID they know, and Synapse keeps the cross-signing signature
+made over the old ones and ignores every later one. ement, though, asks for
+the same device ID on every login, whatever has become of the store. So the
+proxy decides which device a login is:
+
+- **There is a store for it**: the login continues that device, however often
+  ement logs in. If the session was signed out from another client in the
+  meantime, the proxy publishes the device's keys again; it is the same
+  device as before.
+- **There is none** (the first login, or the store directory was deleted):
+  the login is a new device, under an ID the homeserver assigns. Verify it
+  (`ctl bootstrap`), and sign the old session out from another client.
+
+A session that arrives without a login — one ement saved and restored — is
+refused when its device has keys on the homeserver that the proxy does not
+hold: the store directory was deleted, or another program has used the
+session. Those keys cannot be replaced. ement's sync then fails, and
+`ctl debug check` says why; `C-u M-x ement-connect` logs in again, as a new
+device.
+
+To start over: sign the ement session out from another client, delete its
+store directory, connect again.
+
 ## Storage
 
 `~/.local/share/ement-e2ee/{user}/{device}/`:
@@ -214,10 +241,13 @@ Matrix IDs and public keys, but no tokens, passphrases or private keys.
 - `media.sqlite` — mxc → attachment encryption keys (needed to decrypt media
   you've received/sent; deleting it makes old encrypted media undownloadable
   until re-fetched keys arrive by other means).
+- `login.json` — the device ID ement asks for at login, where the proxy chose
+  another: how the next login finds this device again.
 
-Deleting the whole store directory makes the proxy create a fresh olm account
-for the same device ID on next connect — other clients will then warn about a
-changed device. Prefer keeping it; back it up if you care.
+Deleting a store directory starts a new device with the next login (see
+[Devices](#devices)); it does not repair the old one. The room keys in it are
+gone too, except for those the key backup brings back with `ctl bootstrap`.
+Prefer keeping it; back it up if you care.
 
 ## Development
 
@@ -230,8 +260,9 @@ curl http://127.0.0.1:8009/_matrix/client/versions   # smoke test
 The end-to-end tests (`src/e2e_tests.rs`) run real matrix-sdk-crypto machines
 through the proxy against an in-process fake homeserver (`src/testutil.rs`),
 over loopback HTTP: message round trips, `/notifications` and history
-decryption, media, key export/import, placeholder repair, `ctl bootstrap`
-(SSSS, cross-signing, backup restore), `ctl verify` (SAS, interactive and
-step by step) and `ctl debug`. `tests/process.rs` runs the built binary:
+decryption, media, key export/import, placeholder repair, device IDs across
+logins, sign-outs and deleted stores, `ctl bootstrap` (SSSS, cross-signing,
+backup restore), `ctl verify` (SAS, interactive and step by step) and
+`ctl debug`. `tests/process.rs` runs the built binary:
 signals, exit codes, `ctl` against a live proxy, `setup`. None of it needs a
 network or an account.

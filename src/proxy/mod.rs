@@ -11,6 +11,7 @@ use axum::http::header;
 use axum::response::Response;
 
 use crate::config::Config;
+use crate::crypto::device::{DeviceConflict, DeviceUnchecked};
 use crate::error::ProxyError;
 use crate::logbuf::LogBuffer;
 use crate::session::{AccountContext, SessionManager};
@@ -72,20 +73,34 @@ fn bearer_token(req: &Request) -> Option<String> {
 
 /// Get the account context for a token; on failure log and return None so
 /// the caller can fall back to plain passthrough (the upstream will produce
-/// the authoritative auth error).
-async fn context_for(state: &AppState, token: Option<String>) -> Option<Arc<AccountContext>> {
-    let token = token?;
-    match state
+/// the authoritative auth error). A session held back over its device's keys
+/// is an error instead: its token is good, and passed through it would send
+/// in the clear.
+async fn context_for(
+    state: &AppState,
+    token: Option<String>,
+) -> Result<Option<Arc<AccountContext>>, ProxyError> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let error = match state
         .sessions
         .get_or_init(&state.config, &state.upstream, &token)
         .await
     {
-        Ok(ctx) => Some(ctx),
-        Err(e) => {
-            tracing::warn!(error = ?e, "could not initialize session; passing through");
-            None
-        }
-    }
+        Ok(ctx) => return Ok(Some(ctx)),
+        Err(e) => e,
+    };
+    let error = match error.downcast::<DeviceConflict>() {
+        Ok(conflict) => return Err(conflict.into()),
+        Err(other) => other,
+    };
+    let error = match error.downcast::<DeviceUnchecked>() {
+        Ok(unchecked) => return Err(unchecked.into()),
+        Err(other) => other,
+    };
+    tracing::warn!(?error, "could not initialize session; passing through");
+    Ok(None)
 }
 
 async fn handle(State(state): State<AppState>, req: Request) -> Result<Response, ProxyError> {
@@ -98,7 +113,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
     match route {
         Route::Admin(sub) => crate::admin::handle(&state, &sub, req).await,
         Route::Login => login::handle_login(&state, req).await,
-        Route::Sync => match context_for(&state, token).await {
+        Route::Sync => match context_for(&state, token).await? {
             Some(ctx) => crate::crypto::sync::handle_sync(&state, ctx, req).await,
             None => passthrough(&state, req).await,
         },
@@ -106,7 +121,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
         | Route::Context { .. }
         | Route::RoomEvent { .. }
         | Route::Notifications) => {
-            match context_for(&state, token).await {
+            match context_for(&state, token).await? {
                 Some(ctx) => intercept::handle_history_get(&state, ctx, req, route).await,
                 None => passthrough(&state, req).await,
             }
@@ -115,14 +130,14 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
             room_id,
             event_type,
             txn_id,
-        } => match context_for(&state, token).await {
+        } => match context_for(&state, token).await? {
             Some(ctx) => {
                 crate::crypto::encrypt::handle_send(&state, ctx, req, room_id, event_type, txn_id)
                     .await
             }
             None => passthrough(&state, req).await,
         },
-        Route::MediaUpload => match context_for(&state, token).await {
+        Route::MediaUpload => match context_for(&state, token).await? {
             Some(ctx) => crate::crypto::media::handle_upload(&state, ctx, req).await,
             None => passthrough(&state, req).await,
         },
@@ -134,7 +149,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Result<Response,
             // The legacy download path (used by ement for avatars) carries no
             // Bearer token; borrow any active session's upstream credentials.
             let ctx = if authenticated {
-                context_for(&state, token).await
+                context_for(&state, token).await?
             } else {
                 state.sessions.list().await.into_iter().next()
             };

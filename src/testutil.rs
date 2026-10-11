@@ -90,6 +90,8 @@ pub struct HsState {
     idle: bool,
     /// Served at /.well-known/matrix/client when set.
     pub well_known: Option<Value>,
+    /// Answer /keys/query with an error (a homeserver in trouble).
+    pub fail_keys_query: bool,
     /// Leave `device_one_time_keys_count` out of sync responses, as some
     /// homeservers do when nothing changed.
     pub omit_one_time_key_counts: bool,
@@ -370,9 +372,13 @@ impl HsState {
             .pointer("/identifier/user")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let Some((device, token)) = self.logins.get(user).cloned() else {
+        let Some((assigned, token)) = self.logins.get(user).cloned() else {
             return matrix_error(403, "M_FORBIDDEN");
         };
+        // A client may name its device; otherwise the homeserver picks an ID.
+        let device = body["device_id"]
+            .as_str()
+            .map_or(assigned, ToOwned::to_owned);
         self.tokens
             .insert(token.clone(), (user.to_owned(), device.clone()));
         json_response(
@@ -431,6 +437,9 @@ impl HsState {
     }
 
     fn keys_query(&self, requester: &str, body: &Value) -> Response {
+        if self.fail_keys_query {
+            return matrix_error(500, "M_UNKNOWN");
+        }
         let mut response = json!({
             "device_keys": {},
             "failures": {},
@@ -797,7 +806,8 @@ impl FakeHomeserver {
             .insert(token.to_owned(), (user.to_owned(), device.to_owned()));
     }
 
-    /// Let POST /login for `user` succeed, handing out `token`.
+    /// Let the next POST /login for `user` succeed, handing out `token`.
+    /// `device` is the ID assigned when the client does not ask for one.
     pub fn add_login(&self, user: &str, device: &str, token: &str) {
         self.lock()
             .logins
@@ -806,6 +816,26 @@ impl FakeHomeserver {
 
     pub fn revoke(&self, token: &str) {
         self.lock().tokens.remove(token);
+        self.changed();
+    }
+
+    /// Sign a device out, as another client's session manager does: its
+    /// tokens, keys and pending messages go, and everyone is told.
+    pub fn delete_device(&self, user: &str, device: &str) {
+        {
+            let mut hs = self.lock();
+            hs.tokens.retain(|_, (u, d)| !(u == user && d == device));
+            if let Some(devices) = hs.device_keys.get_mut(user) {
+                devices.remove(device);
+            }
+            let key = (user.to_owned(), device.to_owned());
+            hs.one_time_keys.remove(&key);
+            hs.fallback_keys.remove(&key);
+            hs.to_device.remove(&key);
+            hs.seq += 1;
+            let seq = hs.seq;
+            hs.device_changes.push((seq, user.to_owned()));
+        }
         self.changed();
     }
 
@@ -892,6 +922,13 @@ impl FakeHomeserver {
             .one_time_keys
             .get(&(user.to_owned(), device.to_owned()))
             .map_or(0, BTreeMap::len)
+    }
+
+    /// The ed25519 identity key the homeserver publishes for a device.
+    pub fn identity_key(&self, user: &str, device: &str) -> Option<String> {
+        self.lock().device_keys.get(user)?.get(device)?["keys"][format!("ed25519:{device}")]
+            .as_str()
+            .map(ToOwned::to_owned)
     }
 
     pub fn has_device_keys(&self, user: &str, device: &str) -> bool {

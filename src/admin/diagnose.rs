@@ -5,12 +5,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use matrix_sdk_crypto::Device;
 use ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde_json::{Value, json};
 use tracing::Level;
 
 use crate::crypto::decrypt::{self, Decryption};
-use crate::crypto::machine::enc;
+use crate::crypto::device;
+use crate::crypto::machine::{account_store_dir, enc};
 use crate::crypto::rooms;
 use crate::proxy::AppState;
 use crate::session::AccountContext;
@@ -80,15 +82,27 @@ fn age_secs(time: Option<SystemTime>) -> Option<u64> {
 pub async fn check(state: &AppState) -> Value {
     let mut proxy = check_homeserver(state).await;
     let sessions = state.sessions.list().await;
-    proxy.push(if sessions.is_empty() {
-        Check::warn(
+    let refused = state.sessions.refused();
+    if !sessions.is_empty() {
+        proxy.push(Check::ok(
+            "sessions",
+            format!("{} connected", sessions.len()),
+        ));
+    } else if refused.is_empty() {
+        proxy.push(Check::warn(
             "sessions",
             "no session yet",
             "connect ement through the proxy (`ement-e2ee setup` prints how)",
-        )
-    } else {
-        Check::ok("sessions", format!("{} connected", sessions.len()))
-    });
+        ));
+    }
+    // ement did connect; the proxy would not have its session.
+    for conflict in &refused {
+        proxy.push(Check::fail(
+            "refused_session",
+            conflict.detail(),
+            conflict.hint(),
+        ));
+    }
     proxy.push(check_store(state));
     proxy.push(check_log(state));
 
@@ -105,7 +119,7 @@ pub async fn check(state: &AppState) -> Value {
     };
     tally(&proxy);
     for ctx in &sessions {
-        let checks = check_session(ctx).await;
+        let checks = check_session(state, ctx).await;
         tally(&checks);
         session_reports.push(json!({
             "user_id": ctx.user_id,
@@ -242,16 +256,16 @@ fn check_log(state: &AppState) -> Check {
     }
 }
 
-async fn check_session(ctx: &Arc<AccountContext>) -> Vec<Check> {
+async fn check_session(state: &AppState, ctx: &Arc<AccountContext>) -> Vec<Check> {
     let mut checks = vec![check_token(ctx).await];
     // Nothing below can be judged with a dead token.
     if checks[0].status == Status::Fail {
         return checks;
     }
-    checks.push(check_device_keys(ctx).await);
+    checks.push(check_device_keys(state, ctx).await);
     checks.push(check_one_time_keys(ctx).await);
     checks.push(check_cross_signing(ctx).await);
-    checks.push(check_device_verified(ctx).await);
+    checks.push(check_device_verified(state, ctx).await);
     checks.push(check_backup(ctx).await);
     checks.push(check_client_sync(ctx));
     checks.push(check_placeholders(ctx));
@@ -296,64 +310,44 @@ async fn check_token(ctx: &AccountContext) -> Check {
     }
 }
 
-/// Does the homeserver publish the keys this device actually holds?
-async fn check_device_keys(ctx: &AccountContext) -> Check {
-    let body = json!({ "device_keys": { ctx.user_id.as_str(): [ctx.device_id.as_str()] } });
-    let published = match ctx
-        .upstream
-        .json_request(
-            reqwest::Method::POST,
-            "/_matrix/client/v3/keys/query",
-            &ctx.token,
-            Some(&body),
-        )
-        .await
-    {
-        Ok((status, body)) if status.is_success() => body,
-        Ok((status, _)) => {
-            return Check::warn(
-                "device_keys",
-                format!("keys/query answered {status}"),
-                "retry later",
-            );
-        }
-        Err(e) => {
-            return Check::warn(
-                "device_keys",
-                format!("keys/query failed: {e:#}"),
-                "retry later",
-            );
-        }
-    };
-    let key_id = format!("ed25519:{}", ctx.device_id);
-    let published_key = published
-        .pointer(&format!(
-            "/device_keys/{}/{}/keys",
-            pointer_escape(ctx.user_id.as_str()),
-            pointer_escape(ctx.device_id.as_str())
-        ))
-        .and_then(|keys| keys.get(&key_id))
-        .and_then(Value::as_str);
-    let ours = ctx.olm.identity_keys().ed25519.to_base64();
-    match published_key {
-        Some(key) if key == ours => Check::ok("device_keys", format!("published (ed25519 {ours})")),
-        Some(_) => Check::fail(
-            "device_keys",
-            "the homeserver has different keys on record for this device ID",
-            "the crypto store was replaced under a live device: log out in ement and log in \
-             again to get a fresh device",
-        ),
-        None => Check::fail(
-            "device_keys",
-            "this device's keys are not on the homeserver",
-            "they are uploaded on connect; see `ement-e2ee ctl debug logs --level warn`",
-        ),
-    }
+/// How to give up a device whose ID is of no use any more.
+fn new_device_hint(state: &AppState, ctx: &AccountContext) -> String {
+    format!(
+        "sign this session out from another client, delete {} and log in again from ement to \
+         continue as a new device",
+        account_store_dir(&state.config, &ctx.user_id, &ctx.device_id).display()
+    )
 }
 
-/// JSON-pointer escaping for a reference token.
-fn pointer_escape(token: &str) -> String {
-    token.replace('~', "~0").replace('/', "~1")
+/// Does the homeserver publish the keys this device actually holds?
+async fn check_device_keys(state: &AppState, ctx: &AccountContext) -> Check {
+    let published =
+        device::published_identity(&ctx.upstream, &ctx.token, &ctx.user_id, &ctx.device_id).await;
+    let ours = ctx.olm.identity_keys().ed25519.to_base64();
+    match published {
+        Ok(Some(key)) if key == ours => {
+            Check::ok("device_keys", format!("published (ed25519 {ours})"))
+        }
+        Ok(Some(_)) => Check::fail(
+            "device_keys",
+            "the homeserver has other keys on record for this device ID than this device holds",
+            format!(
+                "a device's keys cannot be replaced: {}",
+                new_device_hint(state, ctx)
+            ),
+        ),
+        Ok(None) => Check::fail(
+            "device_keys",
+            "this device's keys are not on the homeserver",
+            "they are published when a session starts: reconnect ement (M-x ement-disconnect, \
+             M-x ement-connect); if they stay missing see `ement-e2ee ctl debug logs --level warn`",
+        ),
+        Err(e) => Check::warn(
+            "device_keys",
+            format!("could not ask the homeserver: {e:#}"),
+            "retry later",
+        ),
+    }
 }
 
 async fn check_one_time_keys(ctx: &AccountContext) -> Check {
@@ -423,13 +417,51 @@ async fn check_cross_signing(ctx: &AccountContext) -> Check {
     }
 }
 
-async fn check_device_verified(ctx: &AccountContext) -> Check {
+/// Does the device carry a signature of the account's self-signing key that
+/// was made over other keys than the device has? Synapse leaves a device
+/// ID's signatures in place when the device is signed out, serves them with
+/// the keys the ID gets next, and skips every signature uploaded after.
+async fn has_stale_cross_signature(ctx: &AccountContext, device: &Device) -> bool {
+    if device.is_cross_signed_by_owner() {
+        return false;
+    }
+    let Ok(Some(identity)) = ctx.olm.get_identity(&ctx.user_id, None).await else {
+        return false;
+    };
+    let Some(self_signing_key) = identity
+        .own()
+        .and_then(|own| own.self_signing_key().get_first_key())
+    else {
+        return false;
+    };
+    let key_id = format!("ed25519:{}", self_signing_key.to_base64());
+    serde_json::to_value(device.as_device_keys())
+        .ok()
+        .and_then(|keys| {
+            keys["signatures"][ctx.user_id.as_str()]
+                .get(&key_id)
+                .cloned()
+        })
+        .is_some()
+}
+
+async fn check_device_verified(state: &AppState, ctx: &AccountContext) -> Check {
     let hint =
         "run `ement-e2ee ctl bootstrap`, or `ement-e2ee ctl verify` against a verified device";
     match ctx.olm.get_device(&ctx.user_id, &ctx.device_id, None).await {
         Ok(Some(device)) if device.is_cross_signed_by_owner() => Check::ok(
             "device_verified",
             "cross-signed: other clients show it as verified",
+        ),
+        Ok(Some(device)) if has_stale_cross_signature(ctx, &device).await => Check::fail(
+            "device_verified",
+            "the homeserver holds a cross-signing signature for this device ID that does not \
+             match the device's keys, and keeps it whatever is signed anew: other clients show \
+             this device as unverified, and verifying it again changes nothing",
+            format!(
+                "this device ID had other keys once: {}",
+                new_device_hint(state, ctx)
+            ),
         ),
         Ok(Some(_)) => Check::warn(
             "device_verified",
@@ -961,12 +993,5 @@ mod tests {
         let (what, hint) = explain_undecryptable("MalformedEncryptedEvent", false, None);
         assert!(what.contains("not a well-formed"));
         assert!(hint.contains("nothing can decrypt it"));
-    }
-
-    #[test]
-    fn pointer_escape_handles_ids_with_slashes() {
-        assert_eq!(pointer_escape("@a/b:example.org"), "@a~1b:example.org");
-        assert_eq!(pointer_escape("DEV~ICE"), "DEV~0ICE");
-        assert_eq!(pointer_escape("PLAIN"), "PLAIN");
     }
 }

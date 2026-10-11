@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::crypto;
+use crate::crypto::device::{self, DeviceConflict, DeviceUnchecked};
 use crate::upstream::Upstream;
 
 /// Everything the proxy knows about one logged-in device (one Bearer token).
@@ -39,9 +40,26 @@ pub struct AccountContext {
 #[derive(Clone, Default)]
 pub struct SessionManager {
     inner: Arc<RwLock<HashMap<String, Arc<AccountContext>>>>,
+    /// Sessions turned away, the latest per device, for `ctl debug check`.
+    refused: Arc<std::sync::Mutex<Vec<DeviceConflict>>>,
 }
 
 impl SessionManager {
+    /// The sessions turned away because of their device's keys, until the
+    /// user has a working session again.
+    pub fn refused(&self) -> Vec<DeviceConflict> {
+        self.refused.lock().unwrap().clone()
+    }
+
+    fn refuse(&self, conflict: DeviceConflict) -> anyhow::Error {
+        let mut refused = self.refused.lock().unwrap();
+        refused.retain(|other| {
+            (&other.user_id, &other.device_id) != (&conflict.user_id, &conflict.device_id)
+        });
+        refused.push(conflict.clone());
+        conflict.into()
+    }
+
     pub async fn get(&self, token: &str) -> Option<Arc<AccountContext>> {
         self.inner.read().await.get(token).cloned()
     }
@@ -120,6 +138,12 @@ impl SessionManager {
     ) -> anyhow::Result<Arc<AccountContext>> {
         let user_id: OwnedUserId = user_id.parse().context("invalid user_id")?;
         let device_id: OwnedDeviceId = device_id.into();
+        let store_dir = crypto::machine::account_store_dir(config, &user_id, &device_id);
+
+        // A device ID keeps the identity keys it has (see crypto::device), so
+        // find out which ones the homeserver knows. Asked before taking the
+        // lock: it is a request to the homeserver.
+        let published = device::published_identity(upstream, token, &user_id, &device_id).await;
 
         let mut guard = self.inner.write().await;
         // Re-check under the write lock: two concurrent requests may race here.
@@ -127,11 +151,48 @@ impl SessionManager {
             return Ok(ctx.clone());
         }
 
+        let has_store = device::has_store(&store_dir);
+        if !has_store {
+            // The store about to be made brings new identity keys, which only
+            // a device that has none may be given.
+            match &published {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Err(self.refuse(DeviceConflict {
+                        user_id,
+                        device_id,
+                        store: None,
+                    }));
+                }
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    return Err(DeviceUnchecked { device_id, reason }.into());
+                }
+            }
+        }
+
         let olm = crypto::machine::open_machine(config, &user_id, &device_id).await?;
+        let mut republish = false;
+        if has_store {
+            match &published {
+                Ok(Some(key)) if *key != olm.identity_keys().ed25519.to_base64() => {
+                    return Err(self.refuse(DeviceConflict {
+                        user_id,
+                        device_id,
+                        store: Some(store_dir),
+                    }));
+                }
+                Ok(Some(_)) => {}
+                // The homeserver has lost them: the session was signed out
+                // from another client, and the client has logged in again.
+                Ok(None) => republish = true,
+                // Not knowing is harmless here: a store's keys are published
+                // once, and only anew where they are known to be missing.
+                Err(e) => tracing::debug!(error = ?e, "could not check the published device keys"),
+            }
+        }
         // open_machine created the directory.
-        let media = crypto::media::MediaKeyCache::open(
-            &crypto::machine::account_store_dir(config, &user_id, &device_id).join("media.sqlite"),
-        )?;
+        let media = crypto::media::MediaKeyCache::open(&store_dir.join("media.sqlite"))?;
         tracing::info!(%user_id, %device_id, "session initialized");
 
         let ctx = Arc::new(AccountContext {
@@ -150,13 +211,35 @@ impl SessionManager {
         });
         guard.insert(token.to_owned(), ctx.clone());
         drop(guard);
+        // The user has a working session: earlier refusals are history.
+        self.refused
+            .lock()
+            .unwrap()
+            .retain(|conflict| conflict.user_id != ctx.user_id);
 
         spawn_periodic_pump(&ctx);
         // Flush initial device keys / one-time keys right away so the device
         // shows up on the server without waiting for the first sync.
         tokio::spawn({
             let ctx = ctx.clone();
-            async move { crypto::machine::pump(&ctx).await }
+            async move {
+                if republish {
+                    match device::republish(&ctx).await {
+                        Ok(()) => tracing::info!(
+                            user_id = %ctx.user_id,
+                            device_id = %ctx.device_id,
+                            "the homeserver had lost this device's keys (was the session signed \
+                             out from another client?); published them again"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = ?e,
+                            "the homeserver has lost this device's keys, and publishing them \
+                             again failed"
+                        ),
+                    }
+                }
+                crypto::machine::pump(&ctx).await
+            }
         });
 
         Ok(ctx)

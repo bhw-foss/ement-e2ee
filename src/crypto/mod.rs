@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod decrypt;
+pub mod device;
 pub mod encrypt;
 pub mod machine;
 pub mod media;
