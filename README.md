@@ -2,12 +2,12 @@
 
 A transparent end-to-end-encryption proxy that gives the Emacs Matrix client
 [ement.el](https://github.com/alphapapa/ement.el) full E2EE support — without
-modifying ement at all. It is a Rust reimplementation of the role
+modifying ement at all. It is a Rust reimplementation of the role the deprecated
 [pantalaimon](https://github.com/matrix-org/pantalaimon) plays in ement's
-README, built on
-[matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk)
-(vodozemac; the same crypto core Element uses) instead of the deprecated
-libolm.
+README, built on the official
+[matrix-sdk-crypto](https://github.com/matrix-org/matrix-rust-sdk) (vodozemac;
+the same crypto core Element uses) instead of the deprecated libolm
+(which pantalaimon was based on).
 
 ```
 Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS──▶  homeserver
@@ -56,13 +56,13 @@ cargo install --path .   # puts ement-e2ee on ~/.cargo/bin
 ## Setup
 
 ```sh
-ement-e2ee setup --user-id @you:example.org
+ement-e2ee setup --user-id @you:example.org # See subsection "By hand" below to see what it does
 ```
 
 finds your homeserver (via `.well-known`), writes
-`~/.config/ement-e2ee/config.toml`, installs and starts a systemd user
-service (after asking), and prints the `ement-connect` form to evaluate in
-Emacs. `--homeserver URL` skips discovery, `--no-service` leaves the service
+`~/.config/ement-e2ee/config.toml`, installs and starts a systemd user service
+(after asking), and prints the `ement-connect` form to evaluate in Emacs (M-x
+'ielm'). `--homeserver URL` skips discovery, `--no-service` leaves the service
 alone, and an existing config is kept unless `--force` is given. Then, with
 ement connected:
 
