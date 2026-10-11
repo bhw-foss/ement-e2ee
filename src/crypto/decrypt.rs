@@ -6,39 +6,57 @@ use ruma::serde::Raw;
 use ruma::{OwnedRoomId, RoomId};
 use serde_json::{Value, json};
 
-use crate::crypto::{machine, rooms};
+use crate::crypto::{machine, repair, rooms};
 use crate::session::AccountContext;
 
-/// Rewrite a /sync response body in place: track room state and decrypt
-/// m.room.encrypted timeline events.
+/// Whether a placeholder emitted for an undecryptable event can later be
+/// replaced in the client (see `repair`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placeholder {
+    /// The event goes into a room timeline the client keeps: remember it
+    /// and repair it when its key arrives.
+    Repairable,
+    /// The event is shown somewhere edits do not reach (notifications).
+    Final,
+}
+
+/// Rewrite a /sync response body in place: track room state, decrypt
+/// m.room.encrypted timeline events, and append repairs for placeholders
+/// whose keys have arrived since.
 pub async fn process_sync_body(ctx: &Arc<AccountContext>, body: &mut Value) {
-    let Some(rooms_value) = body.get_mut("rooms") else {
-        return;
-    };
-    for section in ["join", "leave"] {
-        let Some(section_rooms) = rooms_value.get_mut(section).and_then(Value::as_object_mut)
-        else {
-            continue;
-        };
-        for (room_id_str, room) in section_rooms.iter_mut() {
-            let Ok(room_id) = room_id_str.parse::<OwnedRoomId>() else {
+    if let Some(rooms_value) = body.get_mut("rooms") {
+        for section in ["join", "leave"] {
+            let Some(section_rooms) = rooms_value.get_mut(section).and_then(Value::as_object_mut)
+            else {
                 continue;
             };
-            if let Some(events) = room.pointer("/state/events").and_then(Value::as_array) {
-                rooms::scan_state_events(ctx, &room_id, events).await;
-            }
-            // State events can also arrive in the timeline section.
-            if let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) {
-                rooms::scan_state_events(ctx, &room_id, events).await;
-            }
-            if let Some(events) = room
-                .pointer_mut("/timeline/events")
-                .and_then(Value::as_array_mut)
-            {
-                decrypt_events(ctx, &room_id, events).await;
+            for (room_id_str, room) in section_rooms.iter_mut() {
+                let Ok(room_id) = room_id_str.parse::<OwnedRoomId>() else {
+                    continue;
+                };
+                if section == "join" {
+                    ctx.rooms
+                        .note_joined(&room_id, room.get("unread_notifications"));
+                } else {
+                    ctx.rooms.note_left(&room_id);
+                }
+                if let Some(events) = room.pointer("/state/events").and_then(Value::as_array) {
+                    rooms::scan_state_events(ctx, &room_id, events).await;
+                }
+                // State events can also arrive in the timeline section.
+                if let Some(events) = room.pointer("/timeline/events").and_then(Value::as_array) {
+                    rooms::scan_state_events(ctx, &room_id, events).await;
+                }
+                if let Some(events) = room
+                    .pointer_mut("/timeline/events")
+                    .and_then(Value::as_array_mut)
+                {
+                    decrypt_events(ctx, &room_id, events).await;
+                }
             }
         }
     }
+    repair::inject(ctx, body).await;
 }
 
 /// Rewrite a GET /rooms/{id}/messages response body.
@@ -62,14 +80,14 @@ pub async fn process_context_body(ctx: &Arc<AccountContext>, room_id: &RoomId, b
         }
     }
     if let Some(event) = body.get_mut("event") {
-        decrypt_event(ctx, room_id, event).await;
+        decrypt_event(ctx, room_id, event, Placeholder::Repairable).await;
     }
 }
 
 /// Rewrite a GET /rooms/{id}/event/{event} response body (the body is the
 /// event itself).
 pub async fn process_event_body(ctx: &Arc<AccountContext>, room_id: &RoomId, body: &mut Value) {
-    decrypt_event(ctx, room_id, body).await;
+    decrypt_event(ctx, room_id, body, Placeholder::Repairable).await;
 }
 
 /// Rewrite a GET /notifications response body. Unlike the per-room history
@@ -90,26 +108,48 @@ pub async fn process_notifications_body(ctx: &Arc<AccountContext>, body: &mut Va
             continue;
         };
         if let Some(event) = notification.get_mut("event") {
-            decrypt_event(ctx, &room_id, event).await;
+            // The notifications buffer is not a room timeline: a later edit
+            // would not find these entries.
+            decrypt_event(ctx, &room_id, event, Placeholder::Final).await;
         }
     }
 }
 
-pub async fn decrypt_events(ctx: &Arc<AccountContext>, room_id: &RoomId, events: &mut [Value]) {
+async fn decrypt_events(ctx: &Arc<AccountContext>, room_id: &RoomId, events: &mut [Value]) {
     for event in events {
-        decrypt_event(ctx, room_id, event).await;
+        decrypt_event(ctx, room_id, event, Placeholder::Repairable).await;
     }
 }
 
-async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut Value) {
+/// What became of an attempt to decrypt one m.room.encrypted event.
+pub(crate) enum Decryption {
+    /// The plaintext event, ready for the client.
+    Decrypted(Value),
+    /// No usable key (yet).
+    Undecryptable {
+        reason: String,
+        session_id: Option<String>,
+        raw: Raw<EncryptedEvent>,
+    },
+    /// Not an encrypted event, or a failure that is not about keys: the
+    /// event is passed on as it came.
+    Untouched,
+}
+
+/// Decrypt one event without modifying it.
+pub(crate) async fn decrypt(
+    ctx: &Arc<AccountContext>,
+    room_id: &RoomId,
+    event: &Value,
+) -> Decryption {
     if event.get("type").and_then(|v| v.as_str()) != Some("m.room.encrypted") {
-        return;
+        return Decryption::Untouched;
     }
     let raw: Raw<EncryptedEvent> = match serde_json::from_value(event.clone()) {
         Ok(raw) => raw,
         Err(e) => {
             tracing::warn!(error = ?e, "malformed m.room.encrypted event");
-            return;
+            return Decryption::Untouched;
         }
     };
 
@@ -123,7 +163,7 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(error = ?e, "decrypted event is not valid JSON");
-                    return;
+                    return Decryption::Untouched;
                 }
             };
 
@@ -132,15 +172,13 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
             // Keys already present on the decrypted event win: they may
             // contain decrypted bundled relations.
             let original_unsigned = event.get("unsigned").and_then(Value::as_object).cloned();
-            let new_unsigned = new_event
-                .as_object_mut()
-                .expect("decrypted event is an object")
-                .entry("unsigned")
-                .or_insert_with(|| json!({}));
-            if let (Some(new_unsigned), Some(original)) =
-                (new_unsigned.as_object_mut(), original_unsigned)
-            {
-                for (key, value) in original {
+            let Some(new_object) = new_event.as_object_mut() else {
+                tracing::error!("decrypted event is not a JSON object");
+                return Decryption::Untouched;
+            };
+            let new_unsigned = new_object.entry("unsigned").or_insert_with(|| json!({}));
+            if let Some(new_unsigned) = new_unsigned.as_object_mut() {
+                for (key, value) in original_unsigned.unwrap_or_default() {
                     new_unsigned.entry(key).or_insert(value);
                 }
                 new_unsigned.insert(
@@ -156,17 +194,43 @@ async fn decrypt_event(ctx: &Arc<AccountContext>, room_id: &RoomId, event: &mut 
             maybe_feed_verification(ctx, &new_event).await;
             // Harvest attachment keys and expose plain URLs for ement.
             crate::crypto::media::harvest_and_rewrite_decrypted(ctx, &mut new_event);
-            *event = new_event;
+            Decryption::Decrypted(new_event)
         }
-        Ok(RoomEventDecryptionResult::UnableToDecrypt(info)) => {
-            let reason = format!("{:?}", info.reason);
-            tracing::debug!(%room_id, session_id = ?info.session_id, %reason, "unable to decrypt");
-            maybe_request_room_key(ctx, room_id, &raw, info.session_id.as_deref()).await;
-            *event = utd_placeholder(event, &reason, info.session_id.as_deref());
-        }
+        Ok(RoomEventDecryptionResult::UnableToDecrypt(info)) => Decryption::Undecryptable {
+            reason: format!("{:?}", info.reason),
+            session_id: info.session_id,
+            raw,
+        },
         Err(e) => {
             tracing::error!(error = ?e, "decryption failed with store error");
+            Decryption::Untouched
         }
+    }
+}
+
+async fn decrypt_event(
+    ctx: &Arc<AccountContext>,
+    room_id: &RoomId,
+    event: &mut Value,
+    placeholder: Placeholder,
+) {
+    match decrypt(ctx, room_id, event).await {
+        Decryption::Decrypted(new_event) => *event = new_event,
+        Decryption::Undecryptable {
+            reason,
+            session_id,
+            raw,
+        } => {
+            let session_id = session_id.as_deref();
+            tracing::debug!(%room_id, ?session_id, %reason, "unable to decrypt");
+            maybe_request_room_key(ctx, room_id, &raw, session_id).await;
+            let repairable = placeholder == Placeholder::Repairable;
+            if repairable {
+                ctx.repairs.track(room_id, event, session_id);
+            }
+            *event = utd_placeholder(event, &reason, session_id, repairable);
+        }
+        Decryption::Untouched => {}
     }
 }
 
@@ -193,14 +257,22 @@ async fn maybe_feed_verification(ctx: &Arc<AccountContext>, event: &Value) {
 
 /// Replace an undecryptable event with a readable m.room.message so ement
 /// (which drops m.room.encrypted silently) shows *something*.
-fn utd_placeholder(original: &Value, reason: &str, session_id: Option<&str>) -> Value {
+fn utd_placeholder(
+    original: &Value,
+    reason: &str,
+    session_id: Option<&str>,
+    repairable: bool,
+) -> Value {
+    let hint = if repairable {
+        " This message will update in place if its key arrives."
+    } else {
+        ""
+    };
     let mut placeholder = json!({
         "type": "m.room.message",
         "content": {
             "msgtype": "m.text",
-            "body": format!(
-                "🔒 [undecryptable: {reason}] If keys arrive later, close and reopen the room to retry."
-            ),
+            "body": format!("🔒 [undecryptable: {reason}]{hint}"),
         },
     });
     for key in ["event_id", "sender", "origin_server_ts", "room_id"] {
@@ -235,7 +307,7 @@ mod tests {
             "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "..."},
             "unsigned": {"transaction_id": "1-999", "age": 5},
         });
-        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"));
+        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"), true);
         assert_eq!(placeholder["type"], "m.room.message");
         assert_eq!(placeholder["event_id"], "$abc");
         assert_eq!(placeholder["sender"], "@alice:example.org");
@@ -255,7 +327,7 @@ mod tests {
     fn utd_placeholder_copes_with_sparse_events() {
         // No unsigned, no session ID (e.g. a malformed event).
         let original = json!({ "type": "m.room.encrypted", "event_id": "$abc" });
-        let placeholder = utd_placeholder(&original, "MalformedEncryptedEvent", None);
+        let placeholder = utd_placeholder(&original, "MalformedEncryptedEvent", None, false);
         assert_eq!(placeholder["event_id"], "$abc");
         assert_eq!(placeholder["content"]["msgtype"], "m.text");
         assert_eq!(placeholder["unsigned"]["ement_e2ee"]["utd"], true);
@@ -275,9 +347,23 @@ mod tests {
             "room_id": "!room:example.org",
             "content": { "ciphertext": "..." },
         });
-        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"));
+        let placeholder = utd_placeholder(&original, "MissingRoomKey", Some("sess"), false);
         assert_eq!(placeholder["room_id"], "!room:example.org");
         assert_eq!(placeholder["unsigned"]["ement_e2ee"]["session_id"], "sess");
+    }
+
+    #[test]
+    fn utd_placeholder_only_promises_what_will_happen() {
+        let original = json!({ "type": "m.room.encrypted", "event_id": "$abc" });
+        let body = |repairable| {
+            utd_placeholder(&original, "MissingRoomKey", None, repairable)["content"]["body"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(body(true).contains("update in place"));
+        // Notifications are never repaired: no such promise there.
+        assert_eq!(body(false), "🔒 [undecryptable: MissingRoomKey]");
     }
 }
 

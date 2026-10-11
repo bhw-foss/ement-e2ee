@@ -722,6 +722,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "http",
+ "httpdate",
  "matrix-sdk-crypto",
  "matrix-sdk-sqlite",
  "percent-encoding",

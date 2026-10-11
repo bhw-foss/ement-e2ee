@@ -2,6 +2,7 @@
 //! homeserver in the middle, everything driven over HTTP through the proxy
 //! the way ement drives it.
 
+use anyhow::Context as _;
 use axum::http::Method;
 use matrix_sdk_crypto::secret_storage::SecretStorageKey;
 use matrix_sdk_crypto::store::types::BackupDecryptionKey;
@@ -13,8 +14,11 @@ use ruma::serde::Raw;
 use ruma::{RoomId, UserId};
 use serde_json::{Value, json};
 
+use crate::admin::verify::{self, VerifyUi};
 use crate::crypto::machine::enc;
-use crate::testutil::{ALICE, BOB, Backup, FakeHomeserver, Harness, SERVER_NAME, wait_until};
+use crate::testutil::{
+    ALICE, BOB, Backup, FakeHomeserver, Harness, SERVER_NAME, SyncLoop, wait_for, wait_until,
+};
 
 /// Alice and Bob, each connected through the proxy, sharing one room.
 async fn alice_and_bob(encrypted: bool) -> (Harness, String, String, String) {
@@ -45,7 +49,7 @@ fn assert_utd(event: &Value) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn encrypted_message_round_trip() {
     let (h, room, alice, bob) = alice_and_bob(true).await;
 
@@ -494,7 +498,11 @@ async fn store_survives_proxy_restart() {
     let room = hs.create_room(&[ALICE, BOB], true);
     let store_dir = tempfile::tempdir().unwrap();
 
-    let first = Harness::start_in(hs.clone(), None, store_dir.path()).await;
+    let first = Harness::builder()
+        .homeserver(&hs)
+        .store_dir(store_dir.path())
+        .start()
+        .await;
     let alice = first.connect(ALICE, "ALICEDEVICE").await;
     let bob = first.connect(BOB, "BOBDEVICE").await;
     let event_id = first.send_text(&alice, &room, "remember me").await;
@@ -507,11 +515,15 @@ async fn store_survives_proxy_restart() {
         .unwrap()
         .olm
         .identity_keys();
-    drop(first);
+    first.shutdown().await;
 
     // A new proxy process on the same store: same olm identity, and history
     // still decrypts without any new key exchange.
-    let second = Harness::start_in(hs, None, store_dir.path()).await;
+    let second = Harness::builder()
+        .homeserver(&hs)
+        .store_dir(store_dir.path())
+        .start()
+        .await;
     let path = format!(
         "/_matrix/client/r0/rooms/{}/event/{}",
         enc(&room),
@@ -592,7 +604,7 @@ async fn passthrough_relays_everything_else() {
 
 #[tokio::test]
 async fn admin_api_requires_token_when_configured() {
-    let h = Harness::start_with(FakeHomeserver::start().await, Some("s3cret")).await;
+    let h = Harness::builder().admin_token("s3cret").start().await;
 
     let (status, body) = h.request(Method::GET, "/_ement/status", None, None).await;
     assert_eq!(status, 401);
@@ -697,7 +709,7 @@ async fn admin_status_and_session_selection() {
 async fn key_export_import_restores_history() {
     let hs = FakeHomeserver::start().await;
     let room = hs.create_room(&[ALICE, BOB], true);
-    let old = Harness::start_with(hs.clone(), None).await;
+    let old = Harness::builder().homeserver(&hs).start().await;
     let alice = old.connect(ALICE, "ALICEDEVICE").await;
     let bob = old.connect(BOB, "BOBDEVICE").await;
     old.send_text(&alice, &room, "from the archive").await;
@@ -716,7 +728,7 @@ async fn key_export_import_restores_history() {
     assert!(blob.starts_with("-----BEGIN MEGOLM SESSION DATA-----"));
 
     // Bob's brand-new device behind a second proxy has no keys.
-    let new = Harness::start_with(hs, None).await;
+    let new = Harness::builder().homeserver(&hs).start().await;
     let bob2 = new.connect(BOB, "BOBDEVICE2").await;
     let messages = format!("/_matrix/client/r0/rooms/{}/messages?dir=b", enc(&room));
     let (_, body) = new.get(&bob2, &messages).await;
@@ -813,7 +825,7 @@ impl DirectClient {
 
 /// The `ctl bootstrap` journey: an account with cross-signing, secret storage
 /// and a key backup already set up elsewhere; ement joins it via the proxy.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_joins_existing_identity_and_restores_backup() {
     let h = Harness::start().await;
     let room = h.hs.create_room(&[BOB], true);
@@ -955,6 +967,27 @@ async fn bootstrap_joins_existing_identity_and_restores_backup() {
     let (_, body) = h.get(&ement, &messages).await;
     assert_utd(&body["chunk"][0]);
 
+    // `ctl debug event` knows what would fix it: the key is in the backup.
+    let event_id = body["chunk"][0]["event_id"].as_str().unwrap();
+    let (status, diagnosis) = h
+        .request(
+            Method::GET,
+            &format!("/_ement/debug/event/{}/{}", enc(&room), enc(event_id)),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "diagnosis: {diagnosis}");
+    assert_eq!(diagnosis["outcome"], "undecryptable");
+    assert_eq!(diagnosis["room_key"]["held"], false);
+    assert_eq!(diagnosis["key_in_server_backup"], true);
+    assert!(
+        diagnosis["hint"]
+            .as_str()
+            .unwrap()
+            .contains("ctl bootstrap")
+    );
+
     // A wrong recovery key is rejected and changes nothing.
     let wrong = json!({ "recovery_key": SecretStorageKey::new().to_base58() });
     let (status, body) = h.post(None, "/_ement/bootstrap", &wrong).await;
@@ -1021,11 +1054,11 @@ async fn bootstrap_joins_existing_identity_and_restores_backup() {
 
 /// The `ctl verify` journey between two of Bob's devices, each behind its own
 /// proxy, with the test playing ement's sync loop.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sas_verification_between_own_devices() {
     let hs = FakeHomeserver::start().await;
-    let one = Harness::start_with(hs.clone(), None).await;
-    let two = Harness::start_with(hs, None).await;
+    let one = Harness::builder().homeserver(&hs).start().await;
+    let two = Harness::builder().homeserver(&hs).start().await;
     let token_one = one.connect(BOB, "DEVICEONE").await;
     let token_two = two.connect(BOB, "DEVICETWO").await;
     let sync = async || {
@@ -1150,4 +1183,869 @@ async fn sas_verification_between_own_devices() {
         )
         .await;
     assert_eq!(status, 404);
+}
+
+// ---- Sync processing ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn to_device_events_seen_on_several_syncs_are_processed_once() {
+    let h = Harness::start().await;
+    let room = h.hs.create_room(&[ALICE, BOB], true);
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+    let bob = h.connect(BOB, "BOBDEVICE").await;
+    h.send_text(&alice, &room, "once").await;
+
+    // None of these syncs passes `since`, so nothing acknowledges Alice's
+    // room key and the homeserver delivers it every time, as it does to a
+    // client that retries a sync whose response got lost.
+    for _ in 0..3 {
+        let events = h.sync_timeline(&bob, &room).await;
+        assert_decrypted_text(&events[0], "once");
+    }
+    let stats = h.state.sessions.get(&bob).await.unwrap().sync.stats();
+    assert_eq!(stats.to_device_events, 1);
+    assert_eq!(stats.to_device_duplicates, 2);
+    assert_eq!(stats.room_keys_received, 1);
+
+    // The olm channel is unharmed: the conversation goes on in both
+    // directions.
+    h.send_text(&bob, &room, "reply").await;
+    let events = h.sync_timeline(&alice, &room).await;
+    assert_decrypted_text(&events[1], "reply");
+    h.send_text(&alice, &room, "and again").await;
+    let events = h.sync_timeline(&bob, &room).await;
+    assert_decrypted_text(&events[2], "and again");
+}
+
+#[tokio::test]
+async fn omitted_one_time_key_counts_do_not_trigger_uploads() {
+    let h = Harness::start().await;
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+    // Let start-up settle before taking the baseline: a sync answered just
+    // before the first upload landed can cause one extra batch.
+    h.sync(&alice).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let uploaded = h.hs.one_time_key_count(ALICE, "ALICEDEVICE");
+    assert!(uploaded > 0);
+
+    // A homeserver that says nothing about one-time keys when nothing
+    // changed is not saying that there are none left. Publishing a fresh
+    // batch on every such sync would push the still-unclaimed keys out of
+    // the device's memory while the server keeps handing them out.
+    h.hs.lock().omit_one_time_key_counts = true;
+    let uploads = || h.hs.requests_to("/keys/upload").len();
+    let before = uploads();
+    for _ in 0..3 {
+        h.sync(&alice).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(h.hs.one_time_key_count(ALICE, "ALICEDEVICE"), uploaded);
+    assert_eq!(uploads(), before, "keys were uploaded again");
+}
+
+// ---- Placeholder repair ----
+
+/// Alice sends a message whose room key does not reach Bob (yet); Bob syncs
+/// and is shown a placeholder. Returns (event ID, Bob's next_batch).
+async fn bob_sees_placeholder(h: &Harness, room: &str, alice: &str, bob: &str) -> (String, String) {
+    let event_id = h.send_text(alice, room, "worth the wait").await;
+    let sync = h.sync(bob).await;
+    let events = &sync["rooms"]["join"][room]["timeline"]["events"];
+    let placeholder = events.as_array().unwrap().last().unwrap();
+    assert_utd(placeholder);
+    assert_eq!(placeholder["event_id"], event_id.as_str());
+    assert!(
+        placeholder["content"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("update in place")
+    );
+    (event_id, sync["next_batch"].as_str().unwrap().to_owned())
+}
+
+fn assert_repair(event: &Value, original_id: &str, text: &str) {
+    assert_eq!(event["type"], "m.room.message", "event: {event}");
+    assert_eq!(
+        event["content"]["m.relates_to"],
+        json!({ "rel_type": "m.replace", "event_id": original_id }),
+        "event: {event}"
+    );
+    assert_eq!(event["content"]["m.new_content"]["body"], text);
+    assert_eq!(event["content"]["body"], text);
+    assert_ne!(event["event_id"], original_id);
+    assert_eq!(event["sender"], ALICE);
+    assert_eq!(event["unsigned"]["ement_e2ee"]["repairs"], original_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_room_key_repairs_the_placeholder() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    h.hs.lock().hold_to_device = true;
+    let (event_id, since) = bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    let original_ts = h.hs.event(&event_id)["origin_server_ts"].clone();
+
+    // ement is long-polling: upstream has nothing for it.
+    let poll = h.sync_since(&bob, &since, 30_000);
+    tokio::pin!(poll);
+    let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut poll).await;
+    assert!(early.is_err(), "nothing to report yet");
+
+    // The room key finally arrives. The pending sync returns promptly, well
+    // before its 30 s timeout, carrying an edit that replaces the placeholder.
+    h.hs.release_to_device();
+    let sync = tokio::time::timeout(std::time::Duration::from_secs(5), poll)
+        .await
+        .expect("the long-poll is answered as soon as the repair is possible");
+    let events = sync["rooms"]["join"][&room]["timeline"]["events"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_repair(&events[0], &event_id, "worth the wait");
+    // Same position in the timeline and same time as the original.
+    assert_eq!(events[0]["origin_server_ts"], original_ts);
+    // The homeserver had nothing to say about the room, so its entry is the
+    // proxy's own: it repeats the unread counts ement was last given
+    // instead of wiping them.
+    assert_eq!(
+        sync["rooms"]["join"][&room]["unread_notifications"],
+        json!({ "notification_count": 1, "highlight_count": 0 })
+    );
+
+    // Repaired once: the next sync is an ordinary one.
+    let since = sync["next_batch"].as_str().unwrap();
+    let sync = h.sync_since(&bob, since, 0).await;
+    assert!(sync["rooms"]["join"].get(&room).is_none(), "sync: {sync}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imported_keys_repair_placeholders() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    // The key share is lost for good.
+    h.hs.lock().drop_to_device = true;
+    let (event_id, since) = bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    h.hs.lock().drop_to_device = false;
+
+    // ement is long-polling, and the homeserver has nothing for it.
+    let poll = h.sync_since(&bob, &since, 30_000);
+    tokio::pin!(poll);
+    let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut poll).await;
+    assert!(early.is_err(), "nothing to report yet");
+
+    // Bob gets the key out of band: an export from a device that has it.
+    let (_, export) = h
+        .post(
+            None,
+            "/_ement/keys/export",
+            &json!({ "passphrase": "pw", "user_id": ALICE }),
+        )
+        .await;
+    let (status, body) = h
+        .post(
+            None,
+            "/_ement/keys/import",
+            &json!({ "passphrase": "pw", "data": export["export"], "user_id": BOB }),
+        )
+        .await;
+    assert_eq!(status, 200, "import: {body}");
+
+    // No need to reopen the room, nor to wait for the long-poll to time
+    // out: the proxy answers it now, with the repair.
+    let sync = tokio::time::timeout(std::time::Duration::from_secs(5), poll)
+        .await
+        .expect("the pending sync is answered when the import makes a repair possible");
+    let events = &sync["rooms"]["join"][&room]["timeline"]["events"];
+    assert_repair(&events[0], &event_id, "worth the wait");
+    // Nothing from upstream was consumed on the client's behalf, so it is
+    // handed its own position back and resumes from there.
+    assert_eq!(sync["next_batch"], since.as_str());
+    assert_eq!(
+        sync["rooms"]["join"][&room]["unread_notifications"],
+        json!({ "notification_count": 1, "highlight_count": 0 })
+    );
+}
+
+#[tokio::test]
+async fn events_redelivered_decrypted_are_not_repaired_again() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    h.hs.lock().hold_to_device = true;
+    let (event_id, since) = bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    h.hs.release_to_device();
+
+    // A full sync (ement restarted, say) delivers the key and the event
+    // itself, now decrypted. An edit on top of that would only add noise.
+    let events = h.sync_timeline(&bob, &room).await;
+    assert_eq!(events.len(), 1);
+    assert_decrypted_text(&events[0], "worth the wait");
+    assert_eq!(events[0]["event_id"], event_id.as_str());
+    let sync = h.sync_since(&bob, &since, 0).await;
+    assert!(sync["rooms"]["join"].get(&room).is_none(), "sync: {sync}");
+}
+
+#[tokio::test]
+async fn placeholders_in_history_and_other_rooms_are_repaired_too() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    let other_room = h.hs.create_room(&[ALICE, BOB], true);
+    h.hs.lock().hold_to_device = true;
+    let first = h.send_text(&alice, &room, "first").await;
+    let second = h.send_text(&alice, &other_room, "second").await;
+
+    // Bob never saw these in a sync; ement fetched them as history.
+    let since = h.sync(&bob).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for room in [&room, &other_room] {
+        let path = format!("/_matrix/client/r0/rooms/{}/messages?dir=b", enc(room));
+        let (_, body) = h.get(&bob, &path).await;
+        assert_utd(&body["chunk"][0]);
+    }
+    // Placeholders in the notifications buffer are not room timeline
+    // entries; they are not tracked (and not double-counted).
+    h.get(&bob, "/_matrix/client/r0/notifications").await;
+    let ctx = h.state.sessions.get(&bob).await.unwrap();
+    assert_eq!(ctx.repairs.pending().len(), 2);
+
+    // The keys arrive with the next sync, which repairs both rooms at once.
+    h.hs.release_to_device();
+    let sync = h.sync_since(&bob, &since, 0).await;
+    let repair_in = |room: &str| sync["rooms"]["join"][room]["timeline"]["events"][0].clone();
+    assert_repair(&repair_in(&room), &first, "first");
+    assert_repair(&repair_in(&other_room), &second, "second");
+    assert!(ctx.repairs.pending().is_empty());
+}
+
+// ---- Interactive verification ----
+
+/// A [`VerifyUi`] that answers the emoji question as scripted and keeps
+/// what it was shown.
+struct ScriptedUi {
+    answer: Option<bool>,
+    shown: Option<Value>,
+    statuses: Vec<String>,
+}
+
+impl ScriptedUi {
+    fn answering(answer: Option<bool>) -> Self {
+        Self {
+            answer,
+            shown: None,
+            statuses: Vec::new(),
+        }
+    }
+}
+
+impl VerifyUi for ScriptedUi {
+    fn status(&mut self, message: &str) {
+        self.statuses.push(message.to_owned());
+    }
+
+    fn confirm_match(&mut self, sas: &Value) -> anyhow::Result<bool> {
+        self.shown = Some(sas.clone());
+        self.answer.context("no answer (standard input is closed)")
+    }
+}
+
+fn verify_options(device: Option<&str>) -> verify::Options {
+    verify::Options {
+        device: device.map(ToOwned::to_owned),
+        user_id: None,
+        with_user: None,
+        timeout: std::time::Duration::from_secs(20),
+        poll: std::time::Duration::from_millis(20),
+    }
+}
+
+/// Two of Bob's devices, each behind its own proxy, that know of each other,
+/// with ement connected and syncing on both machines (verification messages
+/// only travel inside the client's syncs). Keep the returned sync loops
+/// alive for as long as the exchange should go on.
+async fn two_devices() -> (Harness, Harness, [SyncLoop; 2]) {
+    let hs = FakeHomeserver::start().await;
+    let one = Harness::builder().homeserver(&hs).start().await;
+    let two = Harness::builder().homeserver(&hs).start().await;
+    let token_one = one.connect(BOB, "DEVICEONE").await;
+    let token_two = two.connect(BOB, "DEVICETWO").await;
+    let syncing = [
+        one.keep_syncing(&token_one).await,
+        two.keep_syncing(&token_two).await,
+    ];
+    let bob = <&UserId>::try_from(BOB).unwrap();
+    wait_for("DEVICEONE learns about DEVICETWO", async || {
+        let ctx = one.state.sessions.get(&token_one).await.unwrap();
+        let device = ctx.olm.get_device(bob, "DEVICETWO".into(), None).await;
+        device.unwrap().is_some()
+    })
+    .await;
+    (one, two, syncing)
+}
+
+/// `ctl verify --device DEVICETWO` on one machine and plain `ctl verify`
+/// (waiting for a request) on the other, at the same time.
+async fn verify_both(
+    one: &Harness,
+    two: &Harness,
+    ui_one: &mut ScriptedUi,
+    ui_two: &mut ScriptedUi,
+) -> (anyhow::Result<Value>, anyhow::Result<Value>) {
+    let (client_one, client_two) = (one.ctl(), two.ctl());
+    let (starting, waiting) = (verify_options(Some("DEVICETWO")), verify_options(None));
+    tokio::join!(
+        verify::run(&client_one, ui_one, &starting),
+        verify::run(&client_two, ui_two, &waiting),
+    )
+}
+
+async fn trusts(proxy: &Harness, other: &str) -> bool {
+    let bob = <&UserId>::try_from(BOB).unwrap();
+    let ctx = proxy.state.sessions.list().await.remove(0);
+    let device = ctx.olm.get_device(bob, other.into(), None).await.unwrap();
+    device.is_some_and(|device| device.is_verified())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_verification_runs_start_to_finish() {
+    let (one, two, _ement) = two_devices().await;
+    let mut ui_one = ScriptedUi::answering(Some(true));
+    let mut ui_two = ScriptedUi::answering(Some(true));
+
+    let (first, second) = verify_both(&one, &two, &mut ui_one, &mut ui_two).await;
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first["stage"], "done");
+    assert_eq!(second["stage"], "done");
+    assert_eq!(first["other_device"], "DEVICETWO");
+    assert_eq!(second["other_device"], "DEVICEONE");
+
+    // The one question each user was asked showed the same seven emoji.
+    let shown_one = ui_one.shown.unwrap();
+    let shown_two = ui_two.shown.unwrap();
+    assert_eq!(shown_one["emoji"]["symbols"].as_array().unwrap().len(), 7);
+    assert_eq!(shown_one["emoji"]["symbols"], shown_two["emoji"]["symbols"]);
+    assert_eq!(shown_one["decimals"], shown_two["decimals"]);
+    assert!(ui_one.statuses[0].contains("Accept it on DEVICETWO"));
+    assert!(ui_two.statuses[0].contains("Waiting for a verification request"));
+
+    assert!(trusts(&one, "DEVICETWO").await);
+    assert!(trusts(&two, "DEVICEONE").await);
+
+    // The SDK forgets a finished flow on the next sync; `verify show` and
+    // `verify list` still report how it ended.
+    let token_one = one.state.sessions.list().await[0].token.clone();
+    one.sync(&token_one).await;
+    one.sync(&token_one).await;
+    let flow_id = first["flow_id"].as_str().unwrap();
+    let (status, shown) = one
+        .request(
+            Method::GET,
+            &format!("/_ement/verify/{flow_id}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "show: {shown}");
+    assert_eq!(shown["stage"], "done");
+    assert_eq!(shown["finished"], true);
+    let (_, list) = one.request(Method::GET, "/_ement/verify", None, None).await;
+    assert_eq!(list["requests"], json!([]));
+    assert_eq!(list["finished"][0]["flow_id"], flow_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_verification_reports_a_mismatch() {
+    let (one, two, _ement) = two_devices().await;
+    // One user sees different emoji and says so.
+    let mut ui_one = ScriptedUi::answering(Some(true));
+    let mut ui_two = ScriptedUi::answering(Some(false));
+    let (first, second) = verify_both(&one, &two, &mut ui_one, &mut ui_two).await;
+
+    let said_no = second.unwrap_err().to_string();
+    assert!(said_no.contains("did not match"), "{said_no}");
+    // The other side is told why, rather than left waiting.
+    let other = first.unwrap_err().to_string();
+    assert!(other.contains("cancelled"), "{other}");
+    assert!(other.to_lowercase().contains("match"), "{other}");
+    assert!(!trusts(&one, "DEVICETWO").await);
+    assert!(!trusts(&two, "DEVICEONE").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_verification_without_an_answer_cancels_quietly() {
+    let (one, two, _ement) = two_devices().await;
+    let mut ui_one = ScriptedUi::answering(Some(true));
+    // Standard input is closed on this side (run from a script, say).
+    let mut ui_two = ScriptedUi::answering(None);
+    let (first, second) = verify_both(&one, &two, &mut ui_one, &mut ui_two).await;
+
+    assert!(format!("{:#}", second.unwrap_err()).contains("no answer"));
+    // An unanswered question is a cancellation, not a reported mismatch
+    // (which would tell the other user they may be under attack).
+    let other = first.unwrap_err().to_string();
+    assert!(other.contains("cancelled"), "{other}");
+    assert!(!other.to_lowercase().contains("match"), "{other}");
+    assert!(!trusts(&one, "DEVICETWO").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interactive_verification_times_out() {
+    let (one, two, _ement) = two_devices().await;
+    let short = |device: Option<&str>| verify::Options {
+        timeout: std::time::Duration::from_millis(300),
+        ..verify_options(device)
+    };
+
+    // Nobody starts a verification.
+    let mut ui = ScriptedUi::answering(Some(true));
+    let error = verify::run(&two.ctl(), &mut ui, &short(None))
+        .await
+        .unwrap_err();
+    let error = error.to_string();
+    assert!(error.contains("no verification request arrived"), "{error}");
+    // The usual reason, spelled out.
+    assert!(
+        error.contains("while ement is connected and syncing"),
+        "{error}"
+    );
+
+    // Nobody answers ours: it is cancelled, not left dangling on the
+    // other device.
+    let error = verify::run(&one.ctl(), &mut ui, &short(Some("DEVICETWO")))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("did not complete"), "{error}");
+    let (_, list) = one.request(Method::GET, "/_ement/verify", None, None).await;
+    assert_eq!(list["finished"][0]["stage"], "cancelled");
+
+    // An unknown device is reported as such.
+    let error = verify::run(&one.ctl(), &mut ui, &short(Some("NOSUCHDEVICE")))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("NOSUCHDEVICE"), "{error}");
+}
+
+// ---- ctl debug ----
+
+async fn debug_get(h: &Harness, path: &str) -> (u16, Value) {
+    h.request(Method::GET, &format!("/_ement/debug/{path}"), None, None)
+        .await
+}
+
+/// The check with the given ID in a session's (or the proxy's) check list.
+fn check_named<'a>(checks: &'a Value, id: &str) -> &'a Value {
+    checks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == id)
+        .unwrap_or_else(|| panic!("no check {id} in {checks}"))
+}
+
+#[tokio::test]
+async fn debug_check_reports_health_and_remedies() {
+    let h = Harness::start().await;
+
+    // Nothing connected yet.
+    let (status, report) = debug_get(&h, "check").await;
+    assert_eq!(status, 200);
+    assert_eq!(check_named(&report["proxy"], "homeserver")["status"], "ok");
+    assert_eq!(check_named(&report["proxy"], "clock")["status"], "ok");
+    assert_eq!(check_named(&report["proxy"], "store")["status"], "ok");
+    let sessions = check_named(&report["proxy"], "sessions");
+    assert_eq!(sessions["status"], "warn");
+    assert!(sessions["hint"].as_str().unwrap().contains("connect ement"));
+    assert_eq!(report["sessions"], json!([]));
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+
+    // A fresh device: everything works, but it has not joined the account's
+    // cross-signing identity yet, and the report says how to.
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+    let ctx = h.state.sessions.get(&alice).await.unwrap();
+    wait_for("the device learns of itself", async || {
+        let device = ctx.olm.get_device(&ctx.user_id, &ctx.device_id, None).await;
+        device.unwrap().is_some()
+    })
+    .await;
+    let (_, report) = debug_get(&h, "check").await;
+    let session = &report["sessions"][0];
+    assert_eq!(session["user_id"], ALICE);
+    assert_eq!(session["device_id"], "ALICEDEVICE");
+    let checks = &session["checks"];
+    for id in [
+        "token",
+        "device_keys",
+        "one_time_keys",
+        "backup",
+        "client_sync",
+        "placeholders",
+    ] {
+        assert_eq!(check_named(checks, id)["status"], "ok", "{id}: {checks}");
+    }
+    for id in ["cross_signing", "device_verified"] {
+        let check = check_named(checks, id);
+        assert_eq!(check["status"], "warn", "{id}: {checks}");
+        assert!(check["hint"].as_str().unwrap().contains("ctl bootstrap"));
+    }
+    assert_eq!(report["summary"]["fail"], 0);
+    assert_eq!(report["summary"]["warn"], 2);
+    let one_time_keys = check_named(checks, "one_time_keys")["detail"]
+        .as_str()
+        .unwrap();
+    assert!(
+        one_time_keys.ends_with(" on the homeserver"),
+        "{one_time_keys}"
+    );
+}
+
+#[tokio::test]
+async fn debug_check_flags_what_is_broken() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    let checks_for = |report: &Value, user: &str| {
+        report["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["user_id"] == user)
+            .unwrap_or_else(|| panic!("no session for {user} in {report}"))["checks"]
+            .clone()
+    };
+
+    // A message Bob cannot read ...
+    h.hs.lock().drop_to_device = true;
+    bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    // ... and a session whose client never synced: logged in, nothing more.
+    h.hs.add_login("@carol:hs.test", "CAROLDEVICE", "carol-token");
+    let login = json!({ "type": "m.login.password", "identifier": { "user": "@carol:hs.test" } });
+    h.post(None, "/_matrix/client/r0/login", &login).await;
+
+    let (_, report) = debug_get(&h, "check").await;
+    let placeholders = check_named(&checks_for(&report, BOB), "placeholders").clone();
+    assert_eq!(placeholders["status"], "warn");
+    assert!(
+        placeholders["detail"]
+            .as_str()
+            .unwrap()
+            .contains("1 message(s) in 1 room(s)")
+    );
+    assert!(
+        placeholders["hint"]
+            .as_str()
+            .unwrap()
+            .contains("ctl debug event")
+    );
+    let never_synced = check_named(&checks_for(&report, "@carol:hs.test"), "client_sync").clone();
+    assert_eq!(never_synced["status"], "warn");
+    assert!(
+        never_synced["detail"]
+            .as_str()
+            .unwrap()
+            .contains("has not synced")
+    );
+    assert!(
+        never_synced["hint"]
+            .as_str()
+            .unwrap()
+            .contains("only move while ement")
+    );
+    // Warnings only, so far.
+    assert_eq!(report["summary"]["fail"], 0);
+
+    // A dead token is a failure, and with it nothing else can be judged.
+    h.hs.revoke(&alice);
+    let (_, report) = debug_get(&h, "check").await;
+    let checks = checks_for(&report, ALICE);
+    assert_eq!(checks.as_array().unwrap().len(), 1, "{checks}");
+    let token = check_named(&checks, "token");
+    assert_eq!(token["status"], "fail");
+    assert!(token["hint"].as_str().unwrap().contains("log in again"));
+    assert_eq!(report["summary"]["fail"], 1);
+}
+
+#[tokio::test]
+async fn debug_event_explains_each_outcome() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    let readable = h.send_text(&alice, &room, "readable").await;
+    h.sync_timeline(&bob, &room).await;
+    h.hs.lock().drop_to_device = true;
+    h.hs.lock().requests.clear();
+    // Rotate Alice's session so the next message needs a key Bob will not get.
+    let ctx = h.state.sessions.get(&alice).await.unwrap();
+    let room_id = <&RoomId>::try_from(room.as_str()).unwrap();
+    ctx.olm.discard_room_key(room_id).await.unwrap();
+    let (unreadable, _) = bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    let plain =
+        h.hs.inject_event(&room, ALICE, "m.room.message", json!({ "body": "plain" }));
+    let event = async |event_id: &str| {
+        let query = format!(
+            "event/{}/{}?user_id={}",
+            enc(&room),
+            enc(event_id),
+            enc(BOB)
+        );
+        debug_get(&h, &query).await
+    };
+
+    let (status, report) = event(&readable).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["outcome"], "decrypted");
+    assert_eq!(report["decrypted_type"], "m.room.message");
+    assert_eq!(report["room_key"]["held"], true);
+    assert_eq!(report["room_key"]["first_known_index"], 0);
+    assert_eq!(report["sender"], ALICE);
+    assert_eq!(report["algorithm"], "m.megolm.v1.aes-sha2");
+
+    wait_until("Bob's key request is out", || {
+        !h.hs
+            .requests_to("/sendToDevice/m.room_key_request/")
+            .is_empty()
+    })
+    .await;
+    let (_, report) = event(&unreadable).await;
+    assert_eq!(report["outcome"], "undecryptable");
+    assert_eq!(report["room_key"]["held"], false);
+    assert_eq!(report["key_requested"], true);
+    // No backup on this account: the hint offers the remaining ways.
+    assert!(report["key_in_server_backup"].is_null());
+    assert!(
+        report["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("never given the room key")
+    );
+    assert!(report["hint"].as_str().unwrap().contains("keys import"));
+
+    let (_, report) = event(&plain).await;
+    assert_eq!(report["outcome"], "not_encrypted");
+
+    let (status, report) = event("$nonexistent").await;
+    assert_eq!(status, 409);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not hand out this event")
+    );
+    let (status, _) = debug_get(&h, &format!("event/not-a-room/x?user_id={}", enc(BOB))).await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn debug_room_devices_and_session() {
+    let (h, room, alice, bob) = alice_and_bob(true).await;
+    h.send_text(&alice, &room, "hello").await;
+    h.hs.lock().drop_to_device = true;
+    let alice_ctx = h.state.sessions.get(&alice).await.unwrap();
+    let room_id = <&RoomId>::try_from(room.as_str()).unwrap();
+    alice_ctx.olm.discard_room_key(room_id).await.unwrap();
+    let (unreadable, _) = bob_sees_placeholder(&h, &room, &alice, &bob).await;
+    let bob_query = format!("user_id={}", enc(BOB));
+
+    // Room, from Bob's side: settings and what is still unreadable.
+    let (status, report) = debug_get(&h, &format!("room/{}?{bob_query}", enc(&room))).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["encryption"]["encrypted"], true);
+    assert_eq!(report["encryption"]["algorithm"], "m.megolm.v1.aes-sha2");
+    assert_eq!(report["joined_per_client_sync"], true);
+    assert_eq!(
+        report["pending_placeholders"][0]["event_id"],
+        unreadable.as_str()
+    );
+    assert!(report["pending_placeholders"][0]["session_id"].is_string());
+    // Bob has only ever received here, so his device has had no reason to
+    // fetch Alice's device list: a message from him would first need one.
+    assert_eq!(
+        report["members"],
+        json!([
+            { "user_id": ALICE, "devices": 0, "verified_devices": 0 },
+            { "user_id": BOB, "devices": 1, "verified_devices": 1 },
+        ])
+    );
+    // Alice has sent: she knows who her messages are encrypted for.
+    let alice_query = format!("user_id={}", enc(ALICE));
+    let (_, report) = debug_get(&h, &format!("room/{}?{alice_query}", enc(&room))).await;
+    assert_eq!(
+        report["members"],
+        json!([
+            { "user_id": ALICE, "devices": 1, "verified_devices": 1 },
+            { "user_id": BOB, "devices": 1, "verified_devices": 0 },
+        ])
+    );
+    assert_eq!(report["pending_placeholders"], json!([]));
+    let (status, _) = debug_get(&h, &format!("room/nonsense?{bob_query}")).await;
+    assert_eq!(status, 400);
+
+    // Devices: Bob's own by default, anyone's on request.
+    let (_, own) = debug_get(&h, &format!("devices?{bob_query}")).await;
+    assert_eq!(own["user_id"], BOB);
+    assert_eq!(own["tracked"], true);
+    assert_eq!(own["devices"][0]["device_id"], "BOBDEVICE");
+    assert_eq!(own["devices"][0]["this_device"], true);
+    assert_eq!(own["devices"][0]["cross_signed"], false);
+    let published = h.hs.lock().device_keys(BOB, "BOBDEVICE");
+    assert_eq!(
+        own["devices"][0]["ed25519"],
+        published["keys"]["ed25519:BOBDEVICE"]
+    );
+    let (_, theirs) = debug_get(&h, &format!("devices?{alice_query}&user={}", enc(BOB))).await;
+    assert_eq!(theirs["tracked"], true);
+    assert_eq!(theirs["devices"][0]["device_id"], "BOBDEVICE");
+    assert_eq!(theirs["devices"][0]["this_device"], false);
+    assert_eq!(theirs["devices"][0]["verified"], false);
+    let (_, stranger) =
+        debug_get(&h, &format!("devices?{bob_query}&user=%40nobody%3Ahs.test")).await;
+    assert_eq!(stranger["tracked"], false);
+    assert_eq!(stranger["devices"], json!([]));
+    let (status, _) = debug_get(&h, &format!("devices?{bob_query}&user=nonsense")).await;
+    assert_eq!(status, 400);
+
+    // Session: the numbers behind the checks.
+    let (_, session) = debug_get(&h, &format!("session?{bob_query}")).await;
+    assert_eq!(session["device_id"], "BOBDEVICE");
+    assert_eq!(
+        session["identity_keys"]["ed25519"],
+        published["keys"]["ed25519:BOBDEVICE"]
+    );
+    assert_eq!(session["pending_placeholders"], 1);
+    assert_eq!(session["to_device"]["room_keys_received"], 1);
+    assert!(session["client_sync"]["count"].as_u64().unwrap() >= 2);
+    assert!(
+        session["store"]
+            .as_str()
+            .unwrap()
+            .ends_with("@bob:hs.test/BOBDEVICE")
+    );
+
+    // With two sessions the target must be named, as everywhere else.
+    let (status, body) = debug_get(&h, "session").await;
+    assert_eq!(status, 409);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("multiple sessions")
+    );
+}
+
+#[tokio::test]
+async fn debug_logs_report_and_log_level() {
+    let h = Harness::start().await;
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+
+    // The harness installs no log sink, so the tail is empty; the route and
+    // its parameter checking are what is under test here.
+    let (status, logs) = debug_get(&h, "logs?level=warn&limit=5").await;
+    assert_eq!(status, 200);
+    assert_eq!(logs, json!({ "lines": [] }));
+    let (status, body) = debug_get(&h, "logs?level=loud").await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("not a log level"));
+
+    // Likewise it does not own the process's logging.
+    let (status, body) = h
+        .post(
+            None,
+            "/_ement/debug/log-level",
+            &json!({ "filter": "debug" }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    let (status, _) = h.post(None, "/_ement/debug/log-level", &json!({})).await;
+    assert_eq!(status, 400);
+
+    // The report bundles everything and leaks no credentials.
+    let (status, report) = debug_get(&h, "report").await;
+    assert_eq!(status, 200);
+    assert!(report["generated_at"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(report["check"]["sessions"][0]["user_id"], ALICE);
+    assert_eq!(report["sessions"][0]["session"]["device_id"], "ALICEDEVICE");
+    assert_eq!(report["sessions"][0]["devices"]["user_id"], ALICE);
+    assert!(report["logs"]["lines"].is_array());
+    assert!(
+        !report.to_string().contains(&alice),
+        "the access token leaked"
+    );
+
+    let (status, _) = debug_get(&h, "nope").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn debug_api_honours_the_admin_token() {
+    let h = Harness::builder().admin_token("s3cret").start().await;
+    let (status, _) = debug_get(&h, "check").await;
+    assert_eq!(status, 401);
+    let (status, _) = debug_get(&h, "report").await;
+    assert_eq!(status, 401);
+    let (status, _) = h.get("s3cret", "/_ement/debug/check").await;
+    assert_eq!(status, 200);
+    // `ctl` sends the token it found in the config.
+    let report = h.ctl().get("debug/check").await.unwrap();
+    assert_eq!(report["summary"]["fail"], 0);
+}
+
+/// Run `ement-e2ee ctl ARGS...` against a harness proxy, as the command
+/// line would (output goes to the test's captured stdout).
+async fn ctl(h: &Harness, args: &[&str]) -> anyhow::Result<()> {
+    use clap::Parser as _;
+    let cli = crate::Cli::try_parse_from(["ement-e2ee", "ctl"].iter().chain(args)).unwrap();
+    let Some(crate::Command::Ctl(args)) = cli.command else {
+        panic!("not a ctl command");
+    };
+    crate::admin::ctl::run_command(&h.ctl(), args.command).await
+}
+
+#[tokio::test]
+async fn debug_cli_succeeds_when_healthy_and_fails_when_not() {
+    let h = Harness::start().await;
+    let room = h.hs.create_room(&[ALICE], true);
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+    let event_id = h.send_text(&alice, &room, "hello").await;
+
+    // Warnings (no cross-signing yet) do not fail the command ...
+    ctl(&h, &["debug", "check"]).await.unwrap();
+    ctl(&h, &["debug", "check", "--json"]).await.unwrap();
+    // ... and every inspector renders what the proxy answers.
+    ctl(&h, &["status"]).await.unwrap();
+    ctl(&h, &["debug", "session"]).await.unwrap();
+    ctl(&h, &["debug", "devices"]).await.unwrap();
+    ctl(&h, &["debug", "devices", BOB]).await.unwrap();
+    ctl(&h, &["debug", "room", &room]).await.unwrap();
+    ctl(&h, &["debug", "event", &room, &event_id])
+        .await
+        .unwrap();
+    ctl(&h, &["debug", "event", &room, &event_id, "--json"])
+        .await
+        .unwrap();
+    ctl(&h, &["debug", "logs", "--level", "warn"])
+        .await
+        .unwrap();
+    ctl(&h, &["debug", "report"]).await.unwrap();
+    ctl(&h, &["verify", "list"]).await.unwrap();
+
+    // Errors from the proxy come back as errors, with its explanation.
+    let error = ctl(&h, &["debug", "event", &room, "$nope"])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not hand out this event"),
+        "{error}"
+    );
+    let error = ctl(&h, &["debug", "session", "--user-id", BOB])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no active session for @bob:hs.test"),
+        "{error}"
+    );
+    let error = ctl(&h, &["debug", "log-level", "debug"]).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not control its own logging"),
+        "{error}"
+    );
+
+    // A failed check fails the command.
+    h.hs.revoke(&alice);
+    let error = ctl(&h, &["debug", "check"]).await.unwrap_err();
+    assert_eq!(error.to_string(), "1 check(s) failed");
 }

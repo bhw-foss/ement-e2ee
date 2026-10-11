@@ -6,14 +6,18 @@ listen = "127.0.0.1:8009"
 # Your real homeserver (the client-server API base URL).
 homeserver = "https://matrix.example.org"
 
-# Where crypto stores and media key caches live.
+# Where crypto stores and media key caches live (a leading ~ is expanded).
 # store_dir = "~/.local/share/ement-e2ee"   # default
 
 # tracing filter: error | warn | info | debug | trace, or e.g. "ement_e2ee=debug"
+# (`ement-e2ee ctl debug log-level ...` changes it on a running proxy)
 # log_level = "info"
 
-# Optional: encrypt the sqlite crypto store with this passphrase.
+# Optional: encrypt the sqlite crypto store. Either the passphrase itself or,
+# better, a shell command that prints it (a password manager, secret-tool, ...).
+# store_passphrase_command = "pass show ement-e2ee/store"
 # store_passphrase = "..."
 
 # Optional: require `Authorization: Bearer <token>` on the /_ement admin API.
+# `ement-e2ee ctl` reads the token (and `listen`) from this file.
 # admin_token = "..."

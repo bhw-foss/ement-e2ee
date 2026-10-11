@@ -1,4 +1,7 @@
 pub mod ctl;
+pub mod debug;
+pub mod diagnose;
+pub mod verify;
 
 use std::sync::Arc;
 
@@ -91,6 +94,11 @@ pub async fn handle(state: &AppState, sub: &str, req: Request) -> Result<Respons
             };
             use crate::crypto::verify;
             let result = match action.as_str() {
+                "advance" => {
+                    let start_sas = body.get("start_sas").and_then(|v| v.as_bool()) == Some(true);
+                    verify::advance(&ctx, &with_user, &flow, start_sas).await
+                }
+                "mismatch" => verify::mismatch(&ctx, &with_user, &flow).await,
                 "accept" => verify::accept(&ctx, &with_user, &flow).await,
                 "start-sas" => verify::start_sas(&ctx, &with_user, &flow).await,
                 "sas-accept" => verify::sas_accept(&ctx, &with_user, &flow).await,
@@ -105,9 +113,118 @@ pub async fn handle(state: &AppState, sub: &str, req: Request) -> Result<Respons
             };
             verify_result(result)
         }
+        (_, ["debug", rest @ ..]) => {
+            let rest: Vec<String> = rest.iter().map(|segment| decode(segment)).collect();
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+            let body = if method == "POST" {
+                read_json_body(req).await?
+            } else {
+                serde_json::Value::Null
+            };
+            debug(state, method.as_str(), &rest, &query, &body).await
+        }
         _ => Ok(json_error(
             StatusCode::NOT_FOUND,
             format!("unknown admin route: {method} {sub}"),
+        )),
+    }
+}
+
+fn decode(segment: &str) -> String {
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// The /_ement/debug/* routes behind `ctl debug`.
+async fn debug(
+    state: &AppState,
+    method: &str,
+    path: &[&str],
+    query: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+) -> Result<Response, ProxyError> {
+    let user_id = query.get("user_id").map(|user| decode(user));
+    let session = || resolve_session(state, user_id.as_deref());
+    let answer = |result: anyhow::Result<serde_json::Value>| match result {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => json_error(StatusCode::CONFLICT, format!("{e:#}")),
+    };
+    let bad_request = |message: String| Ok(json_error(StatusCode::BAD_REQUEST, message));
+
+    match (method, path) {
+        ("GET", ["check"]) => Ok(Json(diagnose::check(state).await).into_response()),
+        ("GET", ["report"]) => Ok(Json(diagnose::report(state).await).into_response()),
+        ("GET", ["session"]) => match session().await {
+            Ok(ctx) => Ok(Json(diagnose::session(state, &ctx).await).into_response()),
+            Err(response) => Ok(response),
+        },
+        ("GET", ["devices"]) => {
+            let ctx = match session().await {
+                Ok(ctx) => ctx,
+                Err(response) => return Ok(response),
+            };
+            let user = match query.get("user") {
+                Some(user) => match diagnose::parse_user(&decode(user)) {
+                    Ok(user) => user,
+                    Err(e) => return bad_request(e.to_string()),
+                },
+                None => ctx.user_id.clone(),
+            };
+            Ok(answer(diagnose::devices(&ctx, &user).await))
+        }
+        ("GET", ["room", room_id]) => {
+            let Ok(room_id) = room_id.parse() else {
+                return bad_request(format!("{room_id:?} is not a room ID"));
+            };
+            match session().await {
+                Ok(ctx) => Ok(answer(diagnose::room(&ctx, &room_id).await)),
+                Err(response) => Ok(response),
+            }
+        }
+        ("GET", ["event", room_id, event_id]) => {
+            let Ok(room_id) = room_id.parse() else {
+                return bad_request(format!("{room_id:?} is not a room ID"));
+            };
+            match session().await {
+                Ok(ctx) => Ok(answer(diagnose::event(&ctx, &room_id, event_id).await)),
+                Err(response) => Ok(response),
+            }
+        }
+        ("GET", ["logs"]) => {
+            let level = query.get("level").map_or("info", String::as_str);
+            let Ok(level) = level.parse::<tracing::Level>() else {
+                return bad_request(format!(
+                    "{level:?} is not a log level (error, warn, info)"
+                ));
+            };
+            let limit = query
+                .get("limit")
+                .and_then(|limit| limit.parse().ok())
+                .unwrap_or(50);
+            Ok(Json(diagnose::logs(state, level, limit)).into_response())
+        }
+        ("POST", ["log-level"]) => {
+            let Some(filter) = body.get("filter").and_then(|v| v.as_str()) else {
+                return bad_request("missing filter".to_owned());
+            };
+            let Some(control) = &state.log_control else {
+                return Ok(json_error(
+                    StatusCode::CONFLICT,
+                    "this proxy does not control its own logging",
+                ));
+            };
+            match control(filter) {
+                Ok(()) => {
+                    tracing::info!(filter, "log filter changed");
+                    Ok(Json(serde_json::json!({ "filter": filter })).into_response())
+                }
+                Err(e) => bad_request(format!("{e:#}")),
+            }
+        }
+        _ => Ok(json_error(
+            StatusCode::NOT_FOUND,
+            format!("unknown debug route: {method} {}", path.join("/")),
         )),
     }
 }
@@ -296,6 +413,8 @@ async fn keys_import(state: &AppState, body: serde_json::Value) -> Result<Respon
         .import_room_keys(keys, None, |_, _| {})
         .await
         .map_err(|e| ProxyError::Internal(e.into()))?;
+    // Placeholders the client is showing may be decryptable now.
+    ctx.repairs.note_bulk_import();
     Ok(Json(serde_json::json!({
         "imported": result.imported_count,
         "total": result.total_count,
@@ -316,7 +435,12 @@ async fn bootstrap(state: &AppState, body: serde_json::Value) -> Result<Response
     };
 
     match crate::crypto::ssss::bootstrap(&ctx, recovery_key).await {
-        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap()).into_response()),
+        Ok(report) => {
+            // The backup restore may have brought keys for placeholders the
+            // client is showing.
+            ctx.repairs.note_bulk_import();
+            Ok(Json(serde_json::to_value(report).unwrap()).into_response())
+        }
         Err(e) => {
             tracing::error!(error = ?e, "bootstrap failed");
             Ok(json_error(

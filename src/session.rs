@@ -28,6 +28,12 @@ pub struct AccountContext {
     pub rooms: crypto::rooms::RoomTracker,
     /// Persistent mxc -> attachment-encryption-key cache.
     pub media: crypto::media::MediaKeyCache,
+    /// Bookkeeping for the processing of sync responses.
+    pub sync: crypto::sync::SyncState,
+    /// Placeholders shown to the client, awaiting their room keys.
+    pub repairs: crypto::repair::RepairQueue,
+    /// How recent verification flows ended.
+    pub verifications: crypto::verify::VerificationLog,
 }
 
 #[derive(Clone, Default)]
@@ -138,6 +144,9 @@ impl SessionManager {
             share_lock: Mutex::new(()),
             rooms: crypto::rooms::RoomTracker::default(),
             media,
+            sync: crypto::sync::SyncState::default(),
+            repairs: crypto::repair::RepairQueue::default(),
+            verifications: crypto::verify::VerificationLog::default(),
         });
         guard.insert(token.to_owned(), ctx.clone());
         drop(guard);

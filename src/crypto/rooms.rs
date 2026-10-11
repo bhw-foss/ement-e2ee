@@ -21,6 +21,9 @@ pub struct RoomTracker {
     unencrypted: RwLock<HashSet<OwnedRoomId>>,
     /// Megolm session IDs for which a room key request was already sent.
     pub requested_sessions: Mutex<HashSet<String>>,
+    /// Rooms the client is joined to according to its own sync stream, with
+    /// the last `unread_notifications` it was given for each.
+    joined: std::sync::RwLock<HashMap<OwnedRoomId, Option<serde_json::Value>>>,
 }
 
 struct MemberCache {
@@ -63,6 +66,25 @@ impl RoomTracker {
 
     async fn mark_encrypted(&self, room_id: &RoomId) {
         self.unencrypted.write().await.remove(room_id);
+    }
+
+    /// The client's sync carried a `join` entry for this room.
+    pub fn note_joined(&self, room_id: &RoomId, unread_notifications: Option<&serde_json::Value>) {
+        let mut joined = self.joined.write().unwrap();
+        let last = joined.entry(room_id.to_owned()).or_default();
+        if let Some(unread) = unread_notifications {
+            *last = Some(unread.clone());
+        }
+    }
+
+    pub fn note_left(&self, room_id: &RoomId) {
+        self.joined.write().unwrap().remove(room_id);
+    }
+
+    /// None if the client is not (known to be) joined; otherwise the unread
+    /// counts it was last given, if any.
+    pub fn last_unread_notifications(&self, room_id: &RoomId) -> Option<Option<serde_json::Value>> {
+        self.joined.read().unwrap().get(room_id).cloned()
     }
 }
 

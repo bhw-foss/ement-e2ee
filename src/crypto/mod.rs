@@ -3,6 +3,7 @@ pub mod decrypt;
 pub mod encrypt;
 pub mod machine;
 pub mod media;
+pub mod repair;
 pub mod rooms;
 pub mod ssss;
 pub mod sync;

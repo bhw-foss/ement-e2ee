@@ -12,17 +12,27 @@ use axum::response::Response;
 
 use crate::config::Config;
 use crate::error::ProxyError;
+use crate::logbuf::LogBuffer;
 use crate::session::{AccountContext, SessionManager};
 use crate::upstream::Upstream;
 
 use self::passthrough::passthrough;
 use self::routes::{Route, classify};
 
+/// Replaces the log filter of the running process (e.g. "debug",
+/// "ement_e2ee=trace").
+pub type LogControl = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub upstream: Upstream,
     pub sessions: SessionManager,
+    pub started: std::time::SystemTime,
+    /// Recent log lines, for `ctl debug logs`.
+    pub logs: Arc<LogBuffer>,
+    /// None where this process does not own the logging setup.
+    pub log_control: Option<LogControl>,
 }
 
 impl AppState {
@@ -32,6 +42,9 @@ impl AppState {
             config,
             upstream,
             sessions: SessionManager::default(),
+            started: std::time::SystemTime::now(),
+            logs: Arc::default(),
+            log_control: None,
         })
     }
 }

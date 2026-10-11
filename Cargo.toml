@@ -28,6 +28,7 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled"] 
 rpassword = "7"
 dirs = "7"
 http = "1"
+httpdate = "1"
 futures-util = "0.3"
 toml = "1"
 bytes = "1"

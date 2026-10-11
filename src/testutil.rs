@@ -4,7 +4,7 @@
 //! drive the proxy exactly the way ement does.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -83,7 +83,16 @@ pub struct HsState {
     fallback_keys: HashMap<(String, String), BTreeMap<String, Value>>,
     /// (seq, user_id) for device_lists.changed
     device_changes: Vec<(u64, String)>,
-    to_device: HashMap<(String, String), Vec<Value>>,
+    /// Pending to-device events with their stream position; delivered on
+    /// every sync until a `since` token at or past that position acks them.
+    to_device: HashMap<(String, String), Vec<(u64, Value)>>,
+    /// Set by `sync` when a long-pollable request found nothing new.
+    idle: bool,
+    /// Served at /.well-known/matrix/client when set.
+    pub well_known: Option<Value>,
+    /// Leave `device_one_time_keys_count` out of sync responses, as some
+    /// homeservers do when nothing changed.
+    pub omit_one_time_key_counts: bool,
     rooms: BTreeMap<String, Room>,
     media: HashMap<String, Media>,
     /// (user_id, event type) -> content
@@ -94,6 +103,9 @@ pub struct HsState {
     pub requests: Vec<Recorded>,
     /// Swallow to-device messages instead of delivering them (lost room keys).
     pub drop_to_device: bool,
+    /// Keep to-device messages back until `release_to_device` (late room keys).
+    pub hold_to_device: bool,
+    held_to_device: Vec<((String, String), Value)>,
 }
 
 fn json_response(status: u16, body: Value) -> Response {
@@ -137,6 +149,12 @@ impl HsState {
                 return json_response(200, json!({ "versions": ["v1.11"] }));
             }
             ("POST", ["_matrix", "client", _, "login"]) => return self.login(&req.json()),
+            ("GET", [".well-known", "matrix", "client"]) => {
+                return match &self.well_known {
+                    Some(body) => json_response(200, body.clone()),
+                    None => matrix_error(404, "M_NOT_FOUND"),
+                };
+            }
             // Like current homeservers, serve media only on the authenticated
             // endpoint; the legacy one is frozen.
             ("GET", ["_matrix", "media", _, "download", ..]) => {
@@ -221,6 +239,16 @@ impl HsState {
                 ),
                 None => matrix_error(404, "M_NOT_FOUND"),
             },
+            ("GET", ["room_keys", "keys", room_id, session_id]) => {
+                let key = self
+                    .backup
+                    .as_ref()
+                    .and_then(|backup| backup.rooms.get(*room_id)?.get(*session_id));
+                match key {
+                    Some(key) => json_response(200, key.clone()),
+                    None => matrix_error(404, "M_NOT_FOUND"),
+                }
+            }
             ("GET", ["room_keys", "keys"]) => match &self.backup {
                 Some(backup) => {
                     let rooms: serde_json::Map<String, Value> = backup
@@ -492,24 +520,41 @@ impl HsState {
                     vec![device.clone()]
                 };
                 for target in targets {
-                    self.to_device
-                        .entry((user.clone(), target))
-                        .or_default()
-                        .push(json!({ "type": event_type, "sender": sender, "content": content }));
+                    let event = json!({ "type": event_type, "sender": sender, "content": content });
+                    if self.hold_to_device {
+                        self.held_to_device.push(((user.clone(), target), event));
+                    } else {
+                        self.queue_to_device((user.clone(), target), event);
+                    }
                 }
             }
         }
         json_response(200, json!({}))
     }
 
+    fn queue_to_device(&mut self, target: (String, String), event: Value) {
+        self.seq += 1;
+        self.to_device
+            .entry(target)
+            .or_default()
+            .push((self.seq, event));
+    }
+
     fn sync(&mut self, user: &str, device: &str, query: &str) -> Response {
-        let since: u64 = query_param(query, "since")
+        let since_param = query_param(query, "since");
+        let since: u64 = since_param
+            .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let to_device = self
+        // As on a real homeserver, a to-device event keeps being delivered
+        // (to every sync stream of the device) until some request's `since`
+        // acknowledges it.
+        let pending = self
             .to_device
-            .remove(&(user.to_owned(), device.to_owned()))
-            .unwrap_or_default();
+            .entry((user.to_owned(), device.to_owned()))
+            .or_default();
+        pending.retain(|(position, _)| *position > since);
+        let to_device: Vec<Value> = pending.iter().map(|(_, event)| event.clone()).collect();
 
         let mut join = serde_json::Map::new();
         for (room_id, room) in &self.rooms {
@@ -539,11 +584,20 @@ impl HsState {
             if events.is_empty() && state.is_empty() {
                 continue;
             }
+            let unread = room
+                .timeline
+                .iter()
+                .filter(|e| e.json["sender"] != user)
+                .count();
             join.insert(
                 room_id.clone(),
                 json!({
                     "timeline": { "events": events, "limited": false },
                     "state": { "events": state },
+                    "unread_notifications": {
+                        "notification_count": unread,
+                        "highlight_count": 0,
+                    },
                 }),
             );
         }
@@ -561,17 +615,22 @@ impl HsState {
             .fallback_keys
             .get(&(user.to_owned(), device.to_owned()))
             .map_or(vec![], |_| vec!["signed_curve25519"]);
-        json_response(
-            200,
-            json!({
-                "next_batch": self.seq.to_string(),
-                "to_device": { "events": to_device },
-                "device_lists": { "changed": changed, "left": [] },
-                "device_one_time_keys_count": self.otk_counts(user, device),
-                "device_unused_fallback_key_types": fallback_types,
-                "rooms": { "join": join },
-            }),
-        )
+        self.idle =
+            since_param.is_some() && to_device.is_empty() && join.is_empty() && changed.is_empty();
+        let mut response = json!({
+            "next_batch": self.seq.to_string(),
+            "to_device": { "events": to_device },
+            "device_lists": { "changed": changed, "left": [] },
+            "device_one_time_keys_count": self.otk_counts(user, device),
+            "device_unused_fallback_key_types": fallback_types,
+            "rooms": { "join": join },
+        });
+        if self.omit_one_time_key_counts {
+            let response = response.as_object_mut().unwrap();
+            response.remove("device_one_time_keys_count");
+            response.remove("device_unused_fallback_key_types");
+        }
+        json_response(200, response)
     }
 
     /// Notify on every event someone else sent into one of the user's rooms.
@@ -639,7 +698,13 @@ fn client_event(event: &StoredEvent, device: &str, with_room_id: bool) -> Value 
     json
 }
 
-async fn hs_handle(State(state): State<Arc<Mutex<HsState>>>, req: Request) -> Response {
+struct Shared {
+    state: Mutex<HsState>,
+    /// Wakes long-polling syncs when something may have changed.
+    changed: tokio::sync::Notify,
+}
+
+async fn hs_handle(State(shared): State<Arc<Shared>>, req: Request) -> Response {
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -662,33 +727,67 @@ async fn hs_handle(State(state): State<Arc<Mutex<HsState>>>, req: Request) -> Re
         .await
         .unwrap()
         .to_vec();
+    shared.state.lock().unwrap().requests.push(recorded.clone());
 
-    let mut hs = state.lock().unwrap();
-    hs.requests.push(recorded.clone());
-    hs.respond(&recorded, token.as_deref())
+    // /sync?timeout=N long-polls: hold the request until there is something
+    // to say or the timeout passes.
+    let deadline = query_param(&recorded.query, "timeout")
+        .and_then(|t| t.parse::<u64>().ok())
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    loop {
+        // Register for wake-ups before looking, so none is missed.
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        {
+            let mut hs = shared.state.lock().unwrap();
+            hs.idle = false;
+            let response = hs.respond(&recorded, token.as_deref());
+            let wait = hs.idle && deadline.is_some_and(|d| tokio::time::Instant::now() < d);
+            if !wait {
+                drop(hs);
+                if recorded.method != Method::GET {
+                    shared.changed.notify_waiters();
+                }
+                return response;
+            }
+        }
+        tokio::select! {
+            () = &mut changed => {}
+            () = tokio::time::sleep_until(deadline.unwrap()) => {}
+        }
+    }
 }
 
 /// Handle to the fake homeserver; cheap to clone.
 #[derive(Clone)]
 pub struct FakeHomeserver {
     pub url: reqwest::Url,
-    state: Arc<Mutex<HsState>>,
+    shared: Arc<Shared>,
 }
 
 impl FakeHomeserver {
     pub async fn start() -> Self {
-        let state = Arc::new(Mutex::new(HsState::default()));
+        let shared = Arc::new(Shared {
+            state: Mutex::new(HsState::default()),
+            changed: tokio::sync::Notify::new(),
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap())
             .parse()
             .unwrap();
-        let router = Router::new().fallback(hs_handle).with_state(state.clone());
+        let router = Router::new().fallback(hs_handle).with_state(shared.clone());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        Self { url, state }
+        Self { url, shared }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, HsState> {
-        self.state.lock().unwrap()
+        self.shared.state.lock().unwrap()
+    }
+
+    /// Wake long-polling syncs after changing state behind their back.
+    fn changed(&self) {
+        self.shared.changed.notify_waiters();
     }
 
     /// Make `token` a valid access token for the given device.
@@ -707,6 +806,19 @@ impl FakeHomeserver {
 
     pub fn revoke(&self, token: &str) {
         self.lock().tokens.remove(token);
+        self.changed();
+    }
+
+    /// Deliver the to-device messages kept back by `hold_to_device`.
+    pub fn release_to_device(&self) {
+        {
+            let mut hs = self.lock();
+            hs.hold_to_device = false;
+            for (target, event) in std::mem::take(&mut hs.held_to_device) {
+                hs.queue_to_device(target, event);
+            }
+        }
+        self.changed();
     }
 
     pub fn create_room(&self, members: &[&str], encrypted: bool) -> String {
@@ -731,9 +843,13 @@ impl FakeHomeserver {
         event_type: &str,
         content: Value,
     ) -> String {
-        let mut hs = self.lock();
-        let txn_id = format!("injected{}", hs.seq);
-        hs.append_event(room_id, sender, "ELSEWHERE", event_type, &txn_id, content)
+        let event_id = {
+            let mut hs = self.lock();
+            let txn_id = format!("injected{}", hs.seq);
+            hs.append_event(room_id, sender, "ELSEWHERE", event_type, &txn_id, content)
+        };
+        self.changed();
+        event_id
     }
 
     /// The event exactly as the homeserver stores it.
@@ -770,6 +886,14 @@ impl FakeHomeserver {
             .unwrap_or_else(|| panic!("no media {mxc} on the homeserver"))
     }
 
+    /// How many one-time keys the device has on the homeserver.
+    pub fn one_time_key_count(&self, user: &str, device: &str) -> usize {
+        self.lock()
+            .one_time_keys
+            .get(&(user.to_owned(), device.to_owned()))
+            .map_or(0, BTreeMap::len)
+    }
+
     pub fn has_device_keys(&self, user: &str, device: &str) -> bool {
         let hs = self.lock();
         hs.device_keys
@@ -802,6 +926,17 @@ pub async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     panic!("timed out waiting until {what}");
 }
 
+/// Like [`wait_until`], for conditions that need to await.
+pub async fn wait_for(what: &str, mut condition: impl AsyncFnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
 /// A proxy instance in front of a fake homeserver.
 pub struct Harness {
     pub hs: FakeHomeserver,
@@ -819,42 +954,108 @@ impl Drop for Harness {
     }
 }
 
-impl Harness {
-    pub async fn start() -> Self {
-        Self::start_with(FakeHomeserver::start().await, None).await
+/// A client sync loop started by [`Harness::keep_syncing`]; stops on drop.
+pub struct SyncLoop(tokio::task::JoinHandle<()>);
+
+impl Drop for SyncLoop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Options for starting a [`Harness`]; the defaults match a default config.
+#[derive(Default)]
+pub struct HarnessBuilder {
+    hs: Option<FakeHomeserver>,
+    admin_token: Option<String>,
+    store_dir: Option<PathBuf>,
+}
+
+impl HarnessBuilder {
+    /// Use an existing homeserver (for multi-proxy tests).
+    pub fn homeserver(mut self, hs: &FakeHomeserver) -> Self {
+        self.hs = Some(hs.clone());
+        self
     }
 
-    /// Start a proxy against an existing homeserver (for multi-proxy tests).
-    pub async fn start_with(hs: FakeHomeserver, admin_token: Option<&str>) -> Self {
-        let store_dir = tempfile::tempdir().unwrap();
-        let mut harness = Self::start_in(hs, admin_token, store_dir.path()).await;
-        harness._store_dir = Some(store_dir);
-        harness
+    pub fn admin_token(mut self, token: &str) -> Self {
+        self.admin_token = Some(token.to_owned());
+        self
     }
 
-    /// Start a proxy on a caller-owned store directory (for restart tests).
-    pub async fn start_in(hs: FakeHomeserver, admin_token: Option<&str>, store_dir: &Path) -> Self {
+    /// Use a caller-owned store directory (for restart tests).
+    pub fn store_dir(mut self, dir: &Path) -> Self {
+        self.store_dir = Some(dir.to_owned());
+        self
+    }
+
+    pub async fn start(self) -> Harness {
+        let hs = match self.hs {
+            Some(hs) => hs,
+            None => FakeHomeserver::start().await,
+        };
+        let (store_dir, owned_dir) = match self.store_dir {
+            Some(dir) => (dir, None),
+            None => {
+                let dir = tempfile::tempdir().unwrap();
+                (dir.path().to_owned(), Some(dir))
+            }
+        };
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             homeserver: hs.url.clone(),
-            store_dir: store_dir.to_owned(),
+            store_dir,
             log_level: "off".to_owned(),
             store_passphrase: None,
-            admin_token: admin_token.map(ToOwned::to_owned),
+            admin_token: self.admin_token,
         };
         let state = AppState::new(Arc::new(config)).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let router = proxy::router(state.clone());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        Self {
+        Harness {
             hs,
             state,
             url,
             http: reqwest::Client::new(),
             server,
-            _store_dir: None,
+            _store_dir: owned_dir,
         }
+    }
+}
+
+impl Harness {
+    pub fn builder() -> HarnessBuilder {
+        HarnessBuilder::default()
+    }
+
+    pub async fn start() -> Self {
+        Self::builder().start().await
+    }
+
+    /// Stop the proxy and wait until it has let go of its sessions (and with
+    /// them the crypto stores), as a process exit would.
+    pub async fn shutdown(self) {
+        let sessions: Vec<_> = self
+            .state
+            .sessions
+            .list()
+            .await
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        self.server.abort();
+        drop(self);
+        wait_until("the proxy has released its sessions", || {
+            sessions.iter().all(|session| session.upgrade().is_none())
+        })
+        .await;
+    }
+
+    /// An admin API client for this proxy, as `ctl` would build it.
+    pub fn ctl(&self) -> crate::admin::ctl::Client {
+        crate::admin::ctl::Client::new(&self.url, self.state.config.admin_token.clone())
     }
 
     /// Send a request through the proxy; returns (status, JSON body or Null).
@@ -933,6 +1134,49 @@ impl Harness {
         let content = json!({ "msgtype": "m.text", "body": text });
         self.send(token, room_id, "m.room.message", &txn_id, &content)
             .await
+    }
+
+    /// Full sync through the proxy; returns the whole response body.
+    pub async fn sync(&self, token: &str) -> Value {
+        let (status, body) = self.get(token, "/_matrix/client/r0/sync").await;
+        assert_eq!(status, 200, "sync failed: {body}");
+        body
+    }
+
+    /// Incremental sync from `since`, long-polling for up to `timeout_ms`.
+    pub async fn sync_since(&self, token: &str, since: &str, timeout_ms: u64) -> Value {
+        let path = format!("/_matrix/client/r0/sync?since={since}&timeout={timeout_ms}");
+        let (status, body) = self.get(token, &path).await;
+        assert_eq!(status, 200, "sync failed: {body}");
+        body
+    }
+
+    /// Keep syncing like a running ement would: incremental long-polls, one
+    /// after the other, until the returned guard is dropped.
+    pub async fn keep_syncing(&self, token: &str) -> SyncLoop {
+        let mut since = self.sync(token).await["next_batch"]
+            .as_str()
+            .expect("next_batch")
+            .to_owned();
+        let (http, url, token) = (self.http.clone(), self.url.clone(), token.to_owned());
+        SyncLoop(tokio::spawn(async move {
+            loop {
+                let request = http
+                    .get(format!(
+                        "{url}/_matrix/client/r0/sync?since={since}&timeout=30000"
+                    ))
+                    .bearer_auth(&token)
+                    .send();
+                let Ok(response) = request.await else { return };
+                let Ok(body) = response.json::<Value>().await else {
+                    return;
+                };
+                match body["next_batch"].as_str() {
+                    Some(next_batch) => since = next_batch.to_owned(),
+                    None => return,
+                }
+            }
+        }))
     }
 
     /// Full sync through the proxy; returns the room's timeline events.

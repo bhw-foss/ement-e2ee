@@ -17,12 +17,13 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
                                    · SSSS recovery, cross-signing, key backup
                                    · encrypted attachments
 ```
-
+    
 ## Features
 
 - **Receive**: decrypts `m.room.encrypted` events in `/sync`, `/messages`,
   `/context`, `/event`, and `/notifications` responses; undecryptable events
   render as a readable placeholder and trigger an automatic room-key request.
+  When the key arrives later, the placeholder is replaced in place.
 - **Send**: transparently encrypts everything sent into encrypted rooms
   (messages, edits, reactions), including establishing olm sessions and
   sharing megolm keys with full (not lazy-loaded) room membership.
@@ -31,7 +32,10 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
   (green shield in Element), and restores your history keys from server-side
   key backup. New room keys are backed up automatically afterwards.
 - **Verification**: emoji (SAS) verification against your other devices via
-  `ctl verify`.
+  `ctl verify`, which asks one question: do the emoji match?
+- **Diagnostics**: `ctl debug check` tests the whole chain and names the
+  remedy for each problem; further subcommands look into a room, an event,
+  the device lists or the logs.
 - **Media**: uploads are encrypted (spec `EncryptedFile`/AES-CTR), downloads
   decrypted on the fly — including ement's tokenless avatar fetches. Media
   sent to unencrypted rooms is re-uploaded as plaintext automatically.
@@ -50,6 +54,35 @@ cargo install --path .   # puts ement-e2ee on ~/.cargo/bin
 ```
 
 ## Setup
+
+```sh
+ement-e2ee setup --user-id @you:example.org
+```
+
+finds your homeserver (via `.well-known`), writes
+`~/.config/ement-e2ee/config.toml`, installs and starts a systemd user
+service (after asking), and prints the `ement-connect` form to evaluate in
+Emacs. `--homeserver URL` skips discovery, `--no-service` leaves the service
+alone, and an existing config is kept unless `--force` is given. Then, with
+ement connected:
+
+```sh
+ement-e2ee ctl bootstrap     # join your encrypted identity (asks for the recovery key)
+ement-e2ee ctl verify        # optional: emoji-verify against another device
+ement-e2ee ctl debug check   # is everything in order?
+```
+
+`ctl bootstrap` imports your cross-signing keys from secret storage, signs
+this device and restores your key backup; the recovery key is prompted for
+(or read from `--recovery-key-file`), never passed via argv.
+
+`ctl verify` waits for a verification started on your other device (in
+Element: Settings → Sessions → the ement session → Verify), or starts one
+itself with `--device DEVICEID`. It shows the emoji, asks whether the other
+device shows the same, and reports the result. Keep ement connected while it
+runs.
+
+### By hand
 
 1. Configure:
 
@@ -91,44 +124,73 @@ cargo install --path .   # puts ement-e2ee on ~/.cargo/bin
    On first sync the proxy registers device keys for ement's device; it shows
    up in Element → Settings → Sessions.
 
-4. Join your encrypted identity (prompts for your recovery key; never passes
-   it via argv):
+## Configuration
 
-   ```sh
-   ement-e2ee ctl status      # sanity check: session listed?
-   ement-e2ee ctl bootstrap   # SSSS import + self-sign + backup restore
-   ```
+`config.example.toml` lists every setting. Beyond `listen` and `homeserver`:
 
-5. Optionally, emoji-verify against another device (e.g. Element):
+- `store_passphrase_command` — a shell command that prints the passphrase
+  encrypting the crypto store (`pass show …`, `secret-tool lookup …`), so it
+  need not sit in the file. `store_passphrase` holds it directly instead.
+- `admin_token` — required on the `/_ement` admin API when set. `ctl` reads
+  it, and the listen address, from the same config file (`ctl --config FILE`
+  for a non-default one).
+- `store_dir` — a leading `~` is expanded.
 
-   ```sh
-   ement-e2ee ctl verify start ELEMENTDEVICEID   # or start it from Element and `verify list`
-   ement-e2ee ctl verify show <flow>             # compare the emoji
-   ement-e2ee ctl verify confirm <flow>
-   ```
+The proxy shuts down cleanly on SIGINT and SIGTERM (`systemctl stop`),
+giving requests in flight three seconds to finish.
 
 ## Admin CLI
 
 ```
 ement-e2ee ctl status
 ement-e2ee ctl bootstrap [--recovery-key-file FILE]
-ement-e2ee ctl verify list|start|show|accept|start-sas|sas-accept|confirm|cancel
+ement-e2ee ctl verify [--device DEVICEID] [--timeout SECS]
+ement-e2ee ctl verify list|start|show|accept|start-sas|sas-accept|confirm|mismatch|cancel
 ement-e2ee ctl keys export FILE   # passphrase-protected, Element-compatible
 ement-e2ee ctl keys import FILE
+ement-e2ee ctl debug check|session|devices|room|event|logs|log-level|report
 ```
 
-The CLI talks to `/_ement/*` on the proxy's listen address; set `admin_token`
-in the config if localhost isn't trustworthy enough for you.
+The CLI talks to `/_ement/*` on the proxy's listen address, which it takes
+from the config file (`--proxy URL` overrides it). The `verify` subcommands
+perform single steps of a flow, for scripting.
+
+## Debugging
+
+Start with `ement-e2ee ctl debug check`. It tests the homeserver connection,
+the clock, the access token, the published device keys and one-time keys,
+cross-signing, the key backup, whether ement is syncing and the messages
+still waiting for keys, and prints what to do about each problem; it exits non-zero
+if a check fails. Then, as needed:
+
+```
+ement-e2ee ctl debug event ROOM_ID EVENT_ID   # why this message does (not) decrypt, and the fix
+ement-e2ee ctl debug room ROOM_ID             # encryption settings, recipients' devices, placeholders
+ement-e2ee ctl debug devices [USER_ID]        # devices and how far each is trusted
+ement-e2ee ctl debug session                  # sync activity, counters, pending work
+ement-e2ee ctl debug logs [--level warn]      # recent log lines, kept in memory
+ement-e2ee ctl debug log-level ement_e2ee=debug   # change the log filter without a restart
+ement-e2ee ctl debug report --output FILE     # all of it as JSON, for a bug report
+```
+
+Every subcommand takes `--json` for the proxy's raw answer and `--user-id`
+to pick a session when several accounts are connected. The report contains
+Matrix IDs and public keys, but no tokens, passphrases or private keys.
 
 ## Caveats
 
-- **Late-arriving keys don't retro-fix delivered events.** The proxy is a
-  pass-through: once ement has rendered a "unable to decrypt" placeholder,
-  arriving keys can't rewrite it. Close and reopen the room buffer — history
-  refetches through `/messages` and decrypts fine. Run `ctl bootstrap` before
-  serious use to make this rare.
+- **Late keys repair placeholders in place, as edits.** When the key for an
+  "undecryptable" placeholder arrives (from the sender, another device, a key
+  import or `ctl bootstrap`), the proxy hands ement an edit that replaces the
+  placeholder, so the message carries ement's `[edited]` marker. Reactions
+  and other non-message events become a one-line note instead; reopening the
+  room renders them properly. Placeholders in the notifications buffer are
+  not repaired, and the proxy forgets which placeholders it has handed out
+  when it restarts.
 - **The proxy only pumps crypto while ement is syncing** (its long-poll is the
-  heartbeat). Keep ement connected during `ctl verify`.
+  heartbeat): room keys and verification messages reach the proxy inside
+  ement's `/sync` responses. Keep ement connected during `ctl verify`;
+  `ctl debug check` warns when it has not synced for two minutes.
 - **Session restore**: if you use `ement-save-sessions`, the proxy re-learns
   the session from the token via `/account/whoami` — nothing to do. If you
   log out (token invalidated), the session is evicted; log in through the
@@ -168,5 +230,8 @@ curl http://127.0.0.1:8009/_matrix/client/versions   # smoke test
 The end-to-end tests (`src/e2e_tests.rs`) run real matrix-sdk-crypto machines
 through the proxy against an in-process fake homeserver (`src/testutil.rs`),
 over loopback HTTP: message round trips, `/notifications` and history
-decryption, media, key export/import, `ctl bootstrap` (SSSS, cross-signing,
-backup restore) and `ctl verify` (SAS). They need no network or account.
+decryption, media, key export/import, placeholder repair, `ctl bootstrap`
+(SSSS, cross-signing, backup restore), `ctl verify` (SAS, interactive and
+step by step) and `ctl debug`. `tests/process.rs` runs the built binary:
+signals, exit codes, `ctl` against a live proxy, `setup`. None of it needs a
+network or an account.
