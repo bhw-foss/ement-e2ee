@@ -134,7 +134,9 @@ fn cancel_summary(info: &matrix_sdk_crypto::CancelInfo) -> Value {
 }
 
 fn sas_summary(sas: &Sas) -> Value {
-    let emoji = sas.emoji().map(|emoji| {
+    // The SDK hands out emoji even when the two sides agreed on decimals
+    // only; showing them would have the users compare emoji with digits.
+    let emoji = sas.emoji().filter(|_| sas.supports_emoji()).map(|emoji| {
         json!({
             "symbols": emoji.iter().map(|e| e.symbol).collect::<Vec<_>>(),
             "descriptions": emoji.iter().map(|e| e.description).collect::<Vec<_>>(),

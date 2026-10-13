@@ -11,7 +11,7 @@ use matrix_sdk_crypto::EncryptionSyncChanges;
 use ruma::api::client::sync::sync_events::DeviceLists;
 use ruma::events::AnyToDeviceEvent;
 use ruma::serde::Raw;
-use ruma::{OneTimeKeyAlgorithm, UInt};
+use ruma::{OneTimeKeyAlgorithm, UInt, uint};
 use tokio::sync::Mutex;
 
 use crate::crypto::machine;
@@ -286,7 +286,7 @@ async fn process_sync_changes(
         .context("invalid device_lists in sync response")?
         .unwrap_or_default();
 
-    let one_time_keys_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = body
+    let mut one_time_keys_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = body
         .get("device_one_time_keys_count")
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()
@@ -305,8 +305,19 @@ async fn process_sync_changes(
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
 
+    // The spec has every /sync response carry the one-time-key counts, an
+    // unlisted algorithm meaning zero. The SDK only reads a count that is
+    // listed, so write the zero out or it never learns its keys ran out.
+    // Some homeservers leave the whole field out when nothing changed;
+    // reading that as "zero keys left" would publish a fresh batch on every
+    // sync, so then the count stays as it is.
+    if body.get("device_one_time_keys_count").is_some() {
+        one_time_keys_counts
+            .entry(OneTimeKeyAlgorithm::SignedCurve25519)
+            .or_insert(uint!(0));
+    }
+
     let n_to_device = to_device_events.len();
-    let has_key_counts = body.get("device_one_time_keys_count").is_some();
     let changes = EncryptionSyncChanges {
         to_device_events,
         changed_devices: &changed_devices,
@@ -315,17 +326,11 @@ async fn process_sync_changes(
         next_batch_token: next_batch,
     };
     let settings = machine::decryption_settings();
-    // The spec has every /sync response carry the one-time-key counts, an
-    // unlisted algorithm meaning zero, and that is how the SDK reads them.
-    // Some homeservers leave the whole field out when nothing changed;
-    // reading that as "zero keys left" would publish a fresh batch on every
-    // sync. For those responses use the variant where absent means unchanged.
-    let result = if has_key_counts {
-        ctx.olm.receive_sync_changes(changes, &settings).await
-    } else {
-        ctx.olm.receive_sync_changes_msc4186(changes, &settings).await
-    };
-    let (_processed, room_key_infos) = result.context("receive_sync_changes failed")?;
+    let (_processed, room_key_infos) = ctx
+        .olm
+        .receive_sync_changes(changes, &settings)
+        .await
+        .context("receive_sync_changes failed")?;
 
     ctx.repairs
         .note_room_keys(room_key_infos.iter().map(|info| info.session_id.clone()));

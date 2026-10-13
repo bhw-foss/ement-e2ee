@@ -7,7 +7,7 @@ use axum::http::Method;
 use matrix_sdk_crypto::secret_storage::SecretStorageKey;
 use matrix_sdk_crypto::store::types::BackupDecryptionKey;
 use matrix_sdk_crypto::types::requests::AnyOutgoingRequest;
-use matrix_sdk_crypto::{EncryptionSettings, OlmMachine, OlmMachineBuilder};
+use matrix_sdk_crypto::{EncryptionSettings, OlmMachine};
 use ruma::events::AnyMessageLikeEventContent;
 use ruma::events::secret::request::SecretName;
 use ruma::serde::Raw;
@@ -1137,10 +1137,7 @@ impl DirectClient {
         let token = format!("token-{device}");
         hs.add_device(user, device, &token);
         let user_id = <&UserId>::try_from(user).unwrap();
-        let olm = OlmMachineBuilder::new(user_id, device.into())
-            .build()
-            .await
-            .unwrap();
+        let olm = OlmMachine::new(user_id, device.into()).await;
         Self {
             olm,
             token,
@@ -1583,6 +1580,24 @@ async fn omitted_one_time_key_counts_do_not_trigger_uploads() {
     }
     assert_eq!(h.hs.one_time_key_count(ALICE, "ALICEDEVICE"), uploaded);
     assert_eq!(uploads(), before, "keys were uploaded again");
+}
+
+#[tokio::test]
+async fn an_unlisted_one_time_key_count_means_none_are_left() {
+    let h = Harness::start().await;
+    let alice = h.connect(ALICE, "ALICEDEVICE").await;
+    h.sync(&alice).await;
+    assert!(h.hs.one_time_key_count(ALICE, "ALICEDEVICE") > 0);
+
+    // The last key is claimed, and the homeserver reports that by listing
+    // no algorithm at all.
+    h.hs.lock().unlisted_zero_one_time_key_counts = true;
+    h.hs.use_up_one_time_keys(ALICE, "ALICEDEVICE");
+    h.sync(&alice).await;
+    wait_until("one-time keys are replenished", || {
+        h.hs.one_time_key_count(ALICE, "ALICEDEVICE") > 0
+    })
+    .await;
 }
 
 // ---- Placeholder repair ----

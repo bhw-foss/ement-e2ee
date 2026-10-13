@@ -44,7 +44,7 @@ Emacs / ement.el  ──plain HTTP──▶  ement-e2ee (localhost)  ──HTTPS
 
 ## Build
 
-Requires Rust ≥ 1.96 (`rustup` recommended). All dependencies, including the
+Requires Rust ≥ 1.93 (`rustup` recommended). All dependencies, including the
 [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) crates, are
 released versions from crates.io, locked by `Cargo.lock`.
 
@@ -253,6 +253,7 @@ Prefer keeping it; back it up if you care.
 
 ```sh
 cargo test          # unit tests plus end-to-end tests (see below)
+cargo +1.93 test --locked   # oldest Rust that Build promises
 cargo run -- serve --homeserver https://matrix.org --log-level debug
 curl http://127.0.0.1:8009/_matrix/client/versions   # smoke test
 ```

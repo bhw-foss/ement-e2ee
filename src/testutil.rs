@@ -95,6 +95,9 @@ pub struct HsState {
     /// Leave `device_one_time_keys_count` out of sync responses, as some
     /// homeservers do when nothing changed.
     pub omit_one_time_key_counts: bool,
+    /// List no algorithm in `device_one_time_keys_count` for a device whose
+    /// one-time keys are used up, as the spec allows.
+    pub unlisted_zero_one_time_key_counts: bool,
     rooms: BTreeMap<String, Room>,
     media: HashMap<String, Media>,
     /// (user_id, event type) -> content
@@ -406,6 +409,9 @@ impl HsState {
             .one_time_keys
             .get(&(user.to_owned(), device.to_owned()))
             .map_or(0, BTreeMap::len);
+        if count == 0 && self.unlisted_zero_one_time_key_counts {
+            return json!({});
+        }
         json!({ "signed_curve25519": count })
     }
 
@@ -914,6 +920,13 @@ impl FakeHomeserver {
             .get(mxc)
             .cloned()
             .unwrap_or_else(|| panic!("no media {mxc} on the homeserver"))
+    }
+
+    /// Use up the device's one-time keys, as other devices claiming them do.
+    pub fn use_up_one_time_keys(&self, user: &str, device: &str) {
+        self.lock()
+            .one_time_keys
+            .insert((user.to_owned(), device.to_owned()), BTreeMap::new());
     }
 
     /// How many one-time keys the device has on the homeserver.

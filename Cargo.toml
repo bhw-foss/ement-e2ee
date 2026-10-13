@@ -2,7 +2,7 @@
 name = "ement-e2ee"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.93"
 description = "Transparent E2EE proxy for ement.el, built on matrix-sdk-crypto"
 license = "Apache-2.0"
 
@@ -10,9 +10,11 @@ license = "Apache-2.0"
 # When bumping the matrix-sdk-* crates, set ruma to the version their workspace
 # Cargo.toml requires so types unify, and rusqlite (below) to the one
 # matrix-sdk-sqlite uses: only one libsqlite3-sys may be linked.
-matrix-sdk-crypto = { version = "0.19.1", features = ["automatic-room-key-forwarding"] }
-matrix-sdk-sqlite = { version = "0.19.1", default-features = false, features = ["crypto-store", "bundled"] }
-ruma = { version = "0.17", features = ["client-api-c", "rand"] }
+# Held at 0.18: 0.19 declares rust-version 1.96, and cargo refuses to build a
+# dependency on an older Rust. Bump them together with rust-version above.
+matrix-sdk-crypto = { version = "0.18.0", features = ["automatic-room-key-forwarding"] }
+matrix-sdk-sqlite = { version = "0.18.0", default-features = false, features = ["crypto-store", "bundled"] }
+ruma = { version = "0.16", features = ["client-api-c", "rand"] }
 
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["macros"] }
@@ -24,7 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
 rpassword = "7"
 dirs = "7"
 http = "1"
